@@ -43,7 +43,30 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    # Third-party
+    'rest_framework',
+    # Local apps
+    'accounts',
+    'repositories',
+    'analysis',
 ]
+
+# Django REST Framework
+# SessionAuthentication: uses Django's session + cookie system (no JWT this phase).
+# IsAuthenticated as the global default: every endpoint is private unless a view
+# explicitly declares AllowAny (register/login do exactly that).
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'rest_framework.authentication.SessionAuthentication',
+    ],
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.IsAuthenticated',
+    ],
+    'DEFAULT_RENDERER_CLASSES': [
+        'rest_framework.renderers.JSONRenderer',
+        'rest_framework.renderers.BrowsableAPIRenderer',
+    ],
+}
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
