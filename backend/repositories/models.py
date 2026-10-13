@@ -14,8 +14,7 @@ class Repository(models.Model):
         help_text="The user who registered this repository.",
     )
     github_url = models.URLField(
-        max_length=500,
-        unique=True,                       # DB constraint: one registration per repo
+        max_length=2048,
         help_text="Canonical GitHub URL, e.g. https://github.com/owner/repo",
     )
     name = models.CharField(
@@ -32,6 +31,14 @@ class Repository(models.Model):
 
     class Meta:
         ordering = ["-created_at"]  # newest first in lists
+        constraints = [
+            # The same URL may be registered by different owners,
+            # but never twice by the same owner.
+            models.UniqueConstraint(
+                fields=["owner", "github_url"],
+                name="unique_repo_url_per_owner",
+            ),
+        ]
 
     def __str__(self):
         return f"{self.owner}/{self.name}"

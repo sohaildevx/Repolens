@@ -7,7 +7,7 @@ from .models import AgentRun, AnalysisRun, CodeChange, Issue, TestResult
 
 @admin.register(AnalysisRun)
 class AnalysisRunAdmin(admin.ModelAdmin):
-    list_display = ("id", "repository", "status", "started_at", "completed_at", "created_at")
+    list_display = ("id", "repository", "status", "start_time", "completion_time", "created_at")
     list_filter = ("status", "created_at")
     search_fields = ("repository__name", "summary")
     list_select_related = ("repository",)

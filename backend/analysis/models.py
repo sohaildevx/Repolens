@@ -39,8 +39,8 @@ class AnalysisRun(models.Model):
         default=RunStatus.PENDING,
     )
     # Nullable on purpose: a PENDING run has not started yet.
-    started_at = models.DateTimeField(null=True, blank=True)
-    completed_at = models.DateTimeField(null=True, blank=True)
+    start_time = models.DateTimeField(null=True, blank=True)
+    completion_time = models.DateTimeField(null=True, blank=True)
     summary = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -51,11 +51,11 @@ class AnalysisRun(models.Model):
             # Let PostgreSQL reject impossible time ranges (completed < started).
             models.CheckConstraint(
                 condition=(
-                    models.Q(completed_at__isnull=True)
-                    | models.Q(started_at__isnull=True)
-                    | models.Q(completed_at__gte=models.F("started_at"))
+                    models.Q(completion_time__isnull=True)
+                    | models.Q(start_time__isnull=True)
+                    | models.Q(completion_time__gte=models.F("start_time"))
                 ),
-                name="analysis_completed_at_not_before_started_at",
+                name="analysisrun_completion_not_before_start",
             ),
         ]
 
@@ -82,16 +82,13 @@ class Issue(models.Model):
         related_name="issues",             # run.issues.all()
     )
     file_path = models.CharField(
-        max_length=500,
+        max_length=1024,
         help_text="Repo-relative path, e.g. src/app.py",
     )
-    # Nullable: some issues apply to a whole file, not one line.
     line_number = models.PositiveIntegerField(
-        null=True,
-        blank=True,
-        help_text="1-based line number; null for file-level issues.",
+        help_text="1-based line number where the issue was detected.",
     )
-    severity = models.CharField(max_length=20, choices=Severity.choices)
+    severity = models.CharField(max_length=10, choices=Severity.choices)
     description = models.TextField()
     suggested_fix = models.TextField(
         blank=True,
@@ -101,6 +98,13 @@ class Issue(models.Model):
 
     class Meta:
         ordering = ["file_path", "line_number"]
+        constraints = [
+            # Lines are 1-based: 0 or negative makes no sense.
+            models.CheckConstraint(
+                condition=models.Q(line_number__gte=1),
+                name="issue_line_number_gte_1",
+            ),
+        ]
 
     def __str__(self):
         return f"{self.file_path}:{self.line_number} [{self.severity}]"
@@ -142,7 +146,7 @@ class CodeChange(models.Model):
         on_delete=models.CASCADE,
         related_name="code_changes",       # agent_run.code_changes.all()
     )
-    file_path = models.CharField(max_length=500)
+    file_path = models.CharField(max_length=1024)
     proposed_diff = models.TextField(
         help_text="Unified diff text (git-style patch)."
     )
@@ -170,8 +174,8 @@ class TestResult(models.Model):
         on_delete=models.CASCADE,
         related_name="test_results",      # agent_run.test_results.all()
     )
-    test_name = models.CharField(max_length=500)
-    status = models.CharField(max_length=20, choices=TestStatus.choices)
+    test_name = models.CharField(max_length=255)
+    status = models.CharField(max_length=10, choices=TestStatus.choices)
     output = models.TextField(
         blank=True,
         help_text="Captured stdout/stderr; may be truncated later.",
