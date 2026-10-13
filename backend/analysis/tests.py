@@ -46,7 +46,12 @@ class AnalysisRunTests(AnalysisModelTestCase):
         self.assertEqual(self.analysis_run.status, RunStatus.PENDING)
         self.assertIsNone(self.analysis_run.start_time)
         self.assertIsNone(self.analysis_run.completion_time)
-        self.assertEqual(str(self.analysis_run), "alice/hello run #1 [pending]")
+        # Use the actual pk: sequence numbers are global across the test run,
+        # so asserting a hard-coded "#1" would be order-dependent.
+        self.assertEqual(
+            str(self.analysis_run),
+            f"alice/hello run #{self.analysis_run.pk} [pending]",
+        )
 
     def test_valid_time_range_accepted(self):
         now = timezone.now()
@@ -160,7 +165,10 @@ class AgentRunChainTests(AnalysisModelTestCase):
 
         self.assertEqual(self.agent.code_changes.count(), 1)
         self.assertEqual(self.agent.test_results.count(), 1)
-        self.assertEqual(str(change), "Change to src/app.py (run #1)")
+        self.assertEqual(
+            str(change),
+            f"Change to src/app.py (run #{self.agent.pk})",
+        )
         self.assertEqual(str(result), "tests.test_login [passed]")
         # FK back-reference works the other way too:
         self.assertEqual(change.agent_run, self.agent)

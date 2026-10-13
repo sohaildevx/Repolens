@@ -7,7 +7,7 @@ from .models import Repository
 
 @admin.register(Repository)
 class RepositoryAdmin(admin.ModelAdmin):
-    list_display = ("name", "owner", "default_branch", "github_url", "created_at")
+    list_display = ("name", "owner", "default_branch", "description", "github_url", "created_at")
     list_filter = ("default_branch", "created_at")
     search_fields = ("name", "github_url", "owner__username")
     # Fetch owner in the same SQL query -> avoids N+1 in list view.

@@ -26,6 +26,11 @@ class Repository(models.Model):
         default="main",
         help_text="Branch to analyze when none is specified.",
     )
+    description = models.TextField(
+        blank=True,
+        default="",
+        help_text="Repository description from GitHub; may be empty.",
+    )
     created_at = models.DateTimeField(auto_now_add=True)  # when registered here
     updated_at = models.DateTimeField(auto_now=True)      # last edit, auto-managed
 
