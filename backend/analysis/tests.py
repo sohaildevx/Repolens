@@ -1,12 +1,16 @@
-"""Tests for the analysis app models: creation, relationships, constraints."""
+"""Tests for the analysis app: models (Phase 3) + API endpoints (Phase 5)."""
 
 from datetime import timedelta
+from unittest.mock import MagicMock, patch
 
+import requests as http_requests
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.test import TestCase
 from django.utils import timezone
+from rest_framework import status
+from rest_framework.test import APIClient, APITestCase
 
 from repositories.models import Repository
 
@@ -20,8 +24,19 @@ from .models import (
     TestResult,
     TestStatus,
 )
+from .services import (
+    AnalyzerTimeout,
+    AnalyzerUnavailable,
+    run_analysis,
+)
 
 User = get_user_model()
+
+RUNS_URL = "/api/analysis/runs/"
+
+
+def run_detail_url(pk):
+    return f"/api/analysis/runs/{pk}/"
 
 
 class AnalysisModelTestCase(TestCase):
@@ -217,3 +232,282 @@ class AgentRunChainTests(AnalysisModelTestCase):
         result.status = "flaky"
         with self.assertRaises(ValidationError):
             result.full_clean()
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: analyzer service + API tests (all external HTTP mocked)
+# ---------------------------------------------------------------------------
+
+
+def _analyzer_response(findings=None, meta=None):
+    """Fake Flask /analyze JSON payload."""
+    return {
+        "findings": findings if findings is not None else [],
+        "meta": meta or {"files_submitted": 1, "findings_count": 0},
+    }
+
+
+def _mock_http_ok(payload=None):
+    """A fake requests.post(...) return value with .status_code and .json()."""
+    mock = MagicMock()
+    mock.status_code = 200
+    mock.json.return_value = payload or _analyzer_response()
+    return mock
+
+
+SAMPLE_FILES = [{"path": "app.py", "content": "x = 1\nprint(x)\n"}]
+
+
+class AnalyzerServiceTests(TestCase):
+    """Unit tests for run_analysis() (no HTTP, no API client)."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create_user(
+            username="alice", email="alice@example.com", password="Str0ng-Pass!x"
+        )
+        cls.repo = Repository.objects.create(
+            owner=cls.user,
+            github_url="https://github.com/octo/hello",
+            name="hello",
+        )
+
+    @patch("analysis.services.requests.post")
+    def test_success_saves_issues_and_completes(self, mock_post):
+        payload = _analyzer_response(findings=[
+            {
+                "file_path": "app.py",
+                "line_number": 1,
+                "rule": "B105",
+                "severity": "high",
+                "description": "Hardcoded password.",
+            },
+        ])
+        mock_post.return_value = _mock_http_ok(payload)
+
+        run = run_analysis(self.repo, SAMPLE_FILES, user=self.user)
+
+        self.assertEqual(run.status, RunStatus.COMPLETED)
+        self.assertIsNotNone(run.start_time)
+        self.assertIsNotNone(run.completion_time)
+        issue = run.issues.get()
+        self.assertEqual(issue.rule, "B105")
+        self.assertEqual(issue.severity, Severity.HIGH)
+        self.assertEqual(issue.file_path, "app.py")
+        self.assertEqual(issue.line_number, 1)
+
+    @patch("analysis.services.requests.post")
+    def test_timeout_marks_run_failed(self, mock_post):
+        """A timeout must not leave the run stuck in 'running'."""
+        mock_post.side_effect = http_requests.Timeout("too slow")
+
+        run = run_analysis(self.repo, SAMPLE_FILES, user=self.user)
+
+        self.assertEqual(run.status, RunStatus.FAILED)
+        self.assertIn("did not respond", run.summary)
+        self.assertIsNotNone(run.completion_time)
+
+    @patch("analysis.services.requests.post")
+    def test_connection_error_marks_run_failed(self, mock_post):
+        mock_post.side_effect = http_requests.ConnectionError("refused")
+
+        run = run_analysis(self.repo, SAMPLE_FILES, user=self.user)
+
+        self.assertEqual(run.status, RunStatus.FAILED)
+        self.assertIn("unreachable", run.summary)
+
+    @patch("analysis.services.requests.post")
+    def test_http_500_marks_run_failed(self, mock_post):
+        mock_post.return_value = MagicMock(status_code=500)
+
+        run = run_analysis(self.repo, SAMPLE_FILES, user=self.user)
+
+        self.assertEqual(run.status, RunStatus.FAILED)
+
+    @patch("analysis.services.requests.post")
+    def test_invalid_json_marks_run_failed(self, mock_post):
+        mock = MagicMock(status_code=200)
+        mock.json.side_effect = ValueError("bad json")
+        mock_post.return_value = mock
+
+        run = run_analysis(self.repo, SAMPLE_FILES, user=self.user)
+
+        self.assertEqual(run.status, RunStatus.FAILED)
+
+    @patch("analysis.services.requests.post")
+    def test_line_zero_finding_clamped_to_one(self, mock_post):
+        """A tool reporting line 0 must not violate the DB constraint."""
+        payload = _analyzer_response(findings=[
+            {
+                "file_path": "app.py",
+                "line_number": 0,
+                "rule": "X",
+                "severity": "low",
+                "description": "weird",
+            },
+        ])
+        mock_post.return_value = _mock_http_ok(payload)
+
+        run = run_analysis(self.repo, SAMPLE_FILES, user=self.user)
+
+        self.assertEqual(run.status, RunStatus.COMPLETED)
+        self.assertEqual(run.issues.get().line_number, 1)
+
+    @patch("analysis.services.requests.post")
+    def test_call_analyzer_timeout_raises_typed_error(self, mock_post):
+        from .services import call_analyzer
+
+        mock_post.side_effect = http_requests.Timeout("slow")
+        with self.assertRaises(AnalyzerTimeout):
+            call_analyzer(SAMPLE_FILES)
+
+    @patch("analysis.services.requests.post")
+    def test_call_analyzer_unreachable_raises_typed_error(self, mock_post):
+        from .services import call_analyzer
+
+        mock_post.side_effect = http_requests.ConnectionError("down")
+        with self.assertRaises(AnalyzerUnavailable):
+            call_analyzer(SAMPLE_FILES)
+
+
+class AnalysisRunAPITests(APITestCase):
+    """POST /api/analysis/runs/ and GET /api/analysis/runs/<id>/."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.alice = User.objects.create_user(
+            username="alice", email="alice@example.com", password="Str0ng-Pass!x"
+        )
+        cls.bob = User.objects.create_user(
+            username="bob", email="bob@example.com", password="Str0ng-Pass!x"
+        )
+        cls.repo = Repository.objects.create(
+            owner=cls.alice,
+            github_url="https://github.com/alice/hello",
+            name="hello",
+        )
+
+    def setUp(self):
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.alice)
+
+    def _payload(self, **overrides):
+        data = {"repository": self.repo.pk, "files": SAMPLE_FILES}
+        data.update(overrides)
+        return data
+
+    @patch("analysis.services.requests.post")
+    def test_successful_run_returns_201_with_findings(self, mock_post):
+        payload = _analyzer_response(findings=[
+            {
+                "file_path": "app.py",
+                "line_number": 2,
+                "rule": "F401",
+                "severity": "medium",
+                "description": "Unused import.",
+            },
+        ])
+        mock_post.return_value = _mock_http_ok(payload)
+
+        response = self.client.post(RUNS_URL, self._payload(), format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["status"], "completed")
+        self.assertEqual(len(response.data["issues"]), 1)
+        self.assertEqual(response.data["issues"][0]["rule"], "F401")
+        # Persisted in PostgreSQL:
+        run = AnalysisRun.objects.get(pk=response.data["id"])
+        self.assertEqual(run.issues.count(), 1)
+
+    @patch("analysis.services.requests.post")
+    def test_analyzer_timeout_returns_502_but_run_saved_failed(self, mock_post):
+        mock_post.side_effect = http_requests.Timeout("slow")
+
+        response = self.client.post(RUNS_URL, self._payload(), format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_502_BAD_GATEWAY)
+        self.assertEqual(response.data["status"], "failed")
+        # The run is saved (not stuck), with a safe summary.
+        run = AnalysisRun.objects.get(pk=response.data["id"])
+        self.assertEqual(run.status, RunStatus.FAILED)
+
+    @patch("analysis.services.requests.post")
+    def test_analyzer_down_returns_502(self, mock_post):
+        mock_post.side_effect = http_requests.ConnectionError("down")
+
+        response = self.client.post(RUNS_URL, self._payload(), format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_502_BAD_GATEWAY)
+        self.assertEqual(response.data["status"], "failed")
+
+    def test_missing_files_returns_400(self):
+        response = self.client.post(
+            RUNS_URL, {"repository": self.repo.pk}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("files", response.data)
+
+    def test_too_many_files_returns_400(self):
+        files = [
+            {"path": f"f{i}.py", "content": "x=1\n"} for i in range(101)
+        ]
+        response = self.client.post(
+            RUNS_URL, self._payload(files=files), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_other_users_repository_returns_404(self):
+        bobs_repo = Repository.objects.create(
+            owner=self.bob,
+            github_url="https://github.com/bob/secret",
+            name="secret",
+        )
+        response = self.client.post(
+            RUNS_URL, self._payload(repository=bobs_repo.pk), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_nonexistent_repository_returns_404(self):
+        response = self.client.post(
+            RUNS_URL, self._payload(repository=99999), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    @patch("analysis.services.requests.post")
+    def test_detail_returns_run_with_issues(self, mock_post):
+        payload = _analyzer_response(findings=[
+            {
+                "file_path": "app.py",
+                "line_number": 1,
+                "rule": "B105",
+                "severity": "high",
+                "description": "Hardcoded password.",
+            },
+        ])
+        mock_post.return_value = _mock_http_ok(payload)
+        created = self.client.post(RUNS_URL, self._payload(), format="json")
+
+        response = self.client.get(run_detail_url(created.data["id"]))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["status"], "completed")
+        self.assertEqual(len(response.data["issues"]), 1)
+        self.assertIn("summary", response.data)
+
+    @patch("analysis.services.requests.post")
+    def test_cannot_access_other_users_run(self, mock_post):
+        mock_post.return_value = _mock_http_ok()
+        created = self.client.post(RUNS_URL, self._payload(), format="json")
+
+        self.client.force_authenticate(user=self.bob)
+        response = self.client.get(run_detail_url(created.data["id"]))
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_unauthenticated_rejected(self):
+        client = APIClient()
+        response = client.post(RUNS_URL, self._payload(), format="json")
+        self.assertIn(
+            response.status_code,
+            (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN),
+        )

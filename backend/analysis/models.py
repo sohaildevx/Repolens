@@ -89,6 +89,12 @@ class Issue(models.Model):
         help_text="1-based line number where the issue was detected.",
     )
     severity = models.CharField(max_length=10, choices=Severity.choices)
+    rule = models.CharField(
+        max_length=50,
+        blank=True,
+        default="",
+        help_text="Rule ID that triggered this issue, e.g. B608 or AST002.",
+    )
     description = models.TextField()
     suggested_fix = models.TextField(
         blank=True,

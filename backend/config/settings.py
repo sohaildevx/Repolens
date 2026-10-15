@@ -68,6 +68,11 @@ REST_FRAMEWORK = {
     ],
 }
 
+# Analyzer service (Flask) -- Django calls this over HTTP.
+# Loopback-only by default; in production this would be a private hostname.
+ANALYZER_URL = os.environ.get('ANALYZER_URL', 'http://127.0.0.1:5001')
+ANALYZER_TIMEOUT_SECONDS = int(os.environ.get('ANALYZER_TIMEOUT', '45'))
+
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
