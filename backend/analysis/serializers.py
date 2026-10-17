@@ -1,44 +1,113 @@
 """Serializers for the analysis app.
 
-The write path validates the file snapshot before it ever reaches Flask:
-- repository must be an integer ID owned by the request.user (checked in view)
-- files must be a non-empty list of {path, content} with sane limits
+The write path validates the file snapshot BEFORE it ever reaches Flask:
+- path shape (no traversal, no absolute paths, no sensitive filenames)
+- per-file and total size limits, file count limit
 
-Limits here mirror the analyzer's own limits (defense in depth): the
-analyzer rejects bad input independently, so a bug in this validation
-cannot be exploited to bypass the service's guards.
+Limits intentionally mirror the analyzer's own guards (see
+analyzer/analyzer.py). This is defense in depth: both services reject the
+same bad input independently, so a bug in one layer cannot be exploited
+to bypass the other.
+
+Two request shapes are supported:
+- AnalysisRequestSerializer  -- POST /api/analysis/runs/   (repository in body)
+- AnalyzeFilesSerializer     -- POST /api/repositories/<id>/analyze/ (URL)
 """
 
 from rest_framework import serializers
 
 from .models import AnalysisRun, Issue
 
+# Keep these aligned with analyzer/analyzer.py (mirrored on purpose).
+MAX_FILES = 100
+MAX_FILE_BYTES = 200_000        # 200 KB per file
+MAX_TOTAL_BYTES = 2_000_000     # 2 MB per submission
+
+# Filenames the analyzer refuses to touch; refuse them one layer earlier.
+SENSITIVE_PATTERNS = {
+    ".env", ".env.local", ".env.production",
+    "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
+    "credentials", "credentials.json", "secrets.json",
+    "service-account.json", ".npmrc", ".pypirc",
+}
+SENSITIVE_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".keystore")
+
+
+def _validate_snapshot_path(path: str) -> str:
+    """Reject unsafe snapshot paths with a 400 (never a 500)."""
+    if not path or "\x00" in path:
+        raise serializers.ValidationError("File path is empty or invalid.")
+    if "\\" in path:
+        raise serializers.ValidationError(
+            "Use forward slashes in file paths."
+        )
+    if path.startswith("/") or (len(path) > 1 and path[1] == ":"):
+        raise serializers.ValidationError(
+            "Absolute paths are not allowed."
+        )
+    if ".." in path.split("/"):
+        raise serializers.ValidationError(
+            "Path traversal ('..') is not allowed."
+        )
+    name = path.rsplit("/", 1)[-1].lower()
+    if name in SENSITIVE_PATTERNS or name.startswith(".env") \
+            or name.endswith(SENSITIVE_SUFFIXES):
+        raise serializers.ValidationError(
+            "Sensitive files are excluded from analysis."
+        )
+    return path
+
 
 class FileEntrySerializer(serializers.Serializer):
-    """One file in the snapshot."""
+    """One file in the snapshot: {"path": ..., "content": ...}."""
 
     path = serializers.CharField(max_length=500)
     content = serializers.CharField(
         allow_blank=True,
-        # Serializer-level cap; the analyzer enforces its own byte limit.
-        trim_whitespace=False,
+        trim_whitespace=False,   # code is whitespace-sensitive
     )
 
+    def validate_path(self, value):
+        return _validate_snapshot_path(value)
 
-class AnalysisRequestSerializer(serializers.Serializer):
-    """Payload for POST /api/analysis/runs/."""
-
-    repository = serializers.IntegerField(min_value=1)
-    files = FileEntrySerializer(many=True, allow_empty=False)
-
-    MAX_FILES = 100
-
-    def validate_files(self, value):
-        if len(value) > self.MAX_FILES:
+    def validate_content(self, value):
+        size = len(value.encode("utf-8", errors="replace"))
+        if size > MAX_FILE_BYTES:
             raise serializers.ValidationError(
-                f"Too many files ({len(value)}); limit is {self.MAX_FILES}."
+                f"File content is {size} bytes; limit is {MAX_FILE_BYTES}."
             )
         return value
+
+
+class BaseSnapshotSerializer(serializers.Serializer):
+    """Shared shape + limits for both analysis request endpoints."""
+
+    files = FileEntrySerializer(many=True, allow_empty=False)
+
+    def validate_files(self, value):
+        if len(value) > MAX_FILES:
+            raise serializers.ValidationError(
+                f"Too many files ({len(value)}); limit is {MAX_FILES}."
+            )
+        total = sum(
+            len(f["content"].encode("utf-8", errors="replace"))
+            for f in value
+        )
+        if total > MAX_TOTAL_BYTES:
+            raise serializers.ValidationError(
+                f"Total payload is {total} bytes; limit is {MAX_TOTAL_BYTES}."
+            )
+        return value
+
+
+class AnalysisRequestSerializer(BaseSnapshotSerializer):
+    """Payload for POST /api/analysis/runs/ (repository id in the body)."""
+
+    repository = serializers.IntegerField(min_value=1)
+
+
+class AnalyzeFilesSerializer(BaseSnapshotSerializer):
+    """Payload for POST /api/repositories/<id>/analyze/ (repository in URL)."""
 
 
 class IssueSerializer(serializers.ModelSerializer):
@@ -52,6 +121,7 @@ class IssueSerializer(serializers.ModelSerializer):
             "line_number",
             "severity",
             "rule",
+            "source",
             "description",
         )
         read_only_fields = fields

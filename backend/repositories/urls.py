@@ -2,6 +2,8 @@
 
 from django.urls import path
 
+from analysis import views as analysis_views
+
 from . import views
 
 app_name = "repositories"
@@ -16,5 +18,13 @@ urlpatterns = [
         "<int:pk>/",
         views.RepositoryDetailView.as_view(),
         name="repository-detail",
+    ),
+    # Analyze a snapshot of this repository. The view lives in the
+    # analysis app (all analysis logic stays there); the route lives here
+    # so every /api/repositories/... path is declared in one file.
+    path(
+        "<int:pk>/analyze/",
+        analysis_views.RepositoryAnalyzeView.as_view(),
+        name="repository-analyze",
     ),
 ]

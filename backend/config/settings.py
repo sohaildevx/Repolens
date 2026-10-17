@@ -72,6 +72,10 @@ REST_FRAMEWORK = {
 # Loopback-only by default; in production this would be a private hostname.
 ANALYZER_URL = os.environ.get('ANALYZER_URL', 'http://127.0.0.1:5001')
 ANALYZER_TIMEOUT_SECONDS = int(os.environ.get('ANALYZER_TIMEOUT', '45'))
+# Optional shared secret: when set, every call to the analyzer carries an
+# X-Analyzer-Token header and the analyzer rejects anything else (401).
+# Both sides must read the SAME environment variable.
+ANALYZER_TOKEN = os.environ.get('ANALYZER_TOKEN', '')
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',

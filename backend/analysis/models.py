@@ -95,6 +95,12 @@ class Issue(models.Model):
         default="",
         help_text="Rule ID that triggered this issue, e.g. B608 or AST002.",
     )
+    source = models.CharField(
+        max_length=20,
+        blank=True,
+        default="",
+        help_text="Engine that produced the issue: ast, ruff or bandit.",
+    )
     description = models.TextField()
     suggested_fix = models.TextField(
         blank=True,

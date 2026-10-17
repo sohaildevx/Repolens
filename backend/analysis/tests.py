@@ -369,6 +369,47 @@ class AnalyzerServiceTests(TestCase):
         with self.assertRaises(AnalyzerUnavailable):
             call_analyzer(SAMPLE_FILES)
 
+    @patch("analysis.services.requests.post")
+    def test_token_header_sent_when_configured(self, mock_post):
+        """When ANALYZER_TOKEN is set, the shared secret rides along."""
+        from .services import call_analyzer
+
+        mock_post.return_value = _mock_http_ok()
+        with self.settings(ANALYZER_TOKEN="s3cret"):
+            call_analyzer(SAMPLE_FILES)
+
+        _, kwargs = mock_post.call_args
+        self.assertEqual(kwargs["headers"], {"X-Analyzer-Token": "s3cret"})
+
+    @patch("analysis.services.requests.post")
+    def test_no_token_header_when_not_configured(self, mock_post):
+        from .services import call_analyzer
+
+        mock_post.return_value = _mock_http_ok()
+        with self.settings(ANALYZER_TOKEN=""):
+            call_analyzer(SAMPLE_FILES)
+
+        _, kwargs = mock_post.call_args
+        self.assertIsNone(kwargs["headers"])
+
+    @patch("analysis.services.requests.post")
+    def test_summary_uses_files_analyzed_not_submitted(self, mock_post):
+        """Files the analyzer skipped (non-.py) must not be claimed analyzed."""
+        mock_post.return_value = _mock_http_ok({
+            "findings": [],
+            "meta": {"files_submitted": 2, "files_analyzed": 1,
+                     "findings_count": 0, "skipped": []},
+        })
+        files = [
+            {"path": "a.py", "content": "x = 1\n"},
+            {"path": "notes.txt", "content": "hello"},
+        ]
+
+        run = run_analysis(self.repo, files, user=self.user)
+
+        self.assertEqual(run.status, RunStatus.COMPLETED)
+        self.assertIn("Analyzed 1 file(s)", run.summary)
+
 
 class AnalysisRunAPITests(APITestCase):
     """POST /api/analysis/runs/ and GET /api/analysis/runs/<id>/."""
@@ -511,3 +552,165 @@ class AnalysisRunAPITests(APITestCase):
             response.status_code,
             (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN),
         )
+
+
+class RepositoryAnalyzeEndpointTests(APITestCase):
+    """POST /api/repositories/<id>/analyze/ -- the spec-preferred endpoint.
+
+    Covers: happy path with source attribution, ownership enforcement,
+    unauthenticated rejection, Django-side path/size validation, and
+    analyzer-timeout handling.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.alice = User.objects.create_user(
+            username="alice", email="alice@example.com", password="Str0ng-Pass!x"
+        )
+        cls.bob = User.objects.create_user(
+            username="bob", email="bob@example.com", password="Str0ng-Pass!x"
+        )
+        cls.repo = Repository.objects.create(
+            owner=cls.alice,
+            github_url="https://github.com/alice/hello",
+            name="hello",
+        )
+
+    def setUp(self):
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.alice)
+        self.url = f"/api/repositories/{self.repo.pk}/analyze/"
+
+    @staticmethod
+    def _finding(**overrides):
+        base = {
+            "file_path": "app.py",
+            "line_number": 1,
+            "rule": "F401",
+            "severity": "medium",
+            "description": "`os` imported but unused",
+            "source": "ruff",
+        }
+        base.update(overrides)
+        return base
+
+    def _payload(self, files=None):
+        return {"files": SAMPLE_FILES if files is None else files}
+
+    @patch("analysis.services.requests.post")
+    def test_analyze_completes_and_saves_source(self, mock_post):
+        mock_post.return_value = _mock_http_ok(
+            {"findings": [self._finding()],
+             "meta": {"files_submitted": 1, "files_analyzed": 1,
+                      "findings_count": 1, "skipped": []}}
+        )
+
+        response = self.client.post(self.url, self._payload(), format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["status"], "completed")
+        self.assertEqual(response.data["repository"], self.repo.pk)
+        issue = response.data["issues"][0]
+        self.assertEqual(issue["rule"], "F401")
+        self.assertEqual(issue["source"], "ruff")
+        # Persisted in PostgreSQL with the source column populated:
+        db_issue = Issue.objects.get(pk=issue["id"])
+        self.assertEqual(db_issue.source, "ruff")
+        self.assertEqual(db_issue.analysis_run.repository_id, self.repo.pk)
+
+    @patch("analysis.services.requests.post")
+    def test_other_users_repository_returns_404(self, mock_post):
+        bobs_repo = Repository.objects.create(
+            owner=self.bob,
+            github_url="https://github.com/bob/secret",
+            name="secret",
+        )
+        response = self.client.post(
+            f"/api/repositories/{bobs_repo.pk}/analyze/",
+            self._payload(), format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        # Ownership rejected BEFORE any analyzer call was made:
+        mock_post.assert_not_called()
+        self.assertFalse(AnalysisRun.objects.exists())
+
+    @patch("analysis.services.requests.post")
+    def test_nonexistent_repository_returns_404(self, mock_post):
+        response = self.client.post(
+            "/api/repositories/99999/analyze/",
+            self._payload(), format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        mock_post.assert_not_called()
+
+    def test_unauthenticated_rejected(self):
+        client = APIClient()
+        response = client.post(self.url, self._payload(), format="json")
+        self.assertIn(
+            response.status_code,
+            (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN),
+        )
+
+    @patch("analysis.services.requests.post")
+    def test_path_traversal_rejected_by_django(self, mock_post):
+        response = self.client.post(
+            self.url,
+            self._payload([{"path": "../../etc/passwd", "content": "x\n"}]),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        mock_post.assert_not_called()   # rejected before reaching Flask
+
+    @patch("analysis.services.requests.post")
+    def test_sensitive_file_rejected_by_django(self, mock_post):
+        response = self.client.post(
+            self.url,
+            self._payload([{"path": ".env", "content": "SECRET=1\n"}]),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        mock_post.assert_not_called()
+
+    @patch("analysis.services.requests.post")
+    def test_absolute_path_rejected_by_django(self, mock_post):
+        response = self.client.post(
+            self.url,
+            self._payload([{"path": "/etc/passwd", "content": "x\n"}]),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        mock_post.assert_not_called()
+
+    @patch("analysis.services.requests.post")
+    def test_oversized_file_rejected_by_django(self, mock_post):
+        response = self.client.post(
+            self.url,
+            self._payload([{"path": "big.py", "content": "x" * 200_001}]),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        mock_post.assert_not_called()
+
+    @patch("analysis.services.requests.post")
+    def test_too_many_files_rejected_by_django(self, mock_post):
+        files = [
+            {"path": f"f{i}.py", "content": "x=1\n"} for i in range(101)
+        ]
+        response = self.client.post(
+            self.url, self._payload(files), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        mock_post.assert_not_called()
+
+    @patch("analysis.services.requests.post")
+    def test_analyzer_timeout_returns_502_not_stuck(self, mock_post):
+        """Timeout -> 502 to the client, run saved as failed (never running)."""
+        mock_post.side_effect = http_requests.Timeout("slow")
+
+        response = self.client.post(self.url, self._payload(), format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_502_BAD_GATEWAY)
+        self.assertEqual(response.data["status"], "failed")
+        run = AnalysisRun.objects.get(pk=response.data["id"])
+        self.assertEqual(run.status, RunStatus.FAILED)
+        self.assertIsNotNone(run.completion_time)

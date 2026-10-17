@@ -1,0 +1,5 @@
+# RepoLens analyzer service (Flask) -- separate from backend/requirements.txt
+# Install:  pip install -r requirements.txt
+flask>=3.1
+ruff>=0.17
+bandit>=1.9

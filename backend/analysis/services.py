@@ -49,11 +49,17 @@ def call_analyzer(files: list[dict]) -> dict:
     url = settings.ANALYZER_URL.rstrip("/") + "/analyze"
     timeout = settings.ANALYZER_TIMEOUT_SECONDS
 
+    # Shared-secret header (both sides read ANALYZER_TOKEN). When unset,
+    # header is None and the analyzer runs open on loopback (dev mode).
+    token = getattr(settings, "ANALYZER_TOKEN", "") or ""
+    headers = {"X-Analyzer-Token": token} if token else None
+
     try:
         response = requests.post(
             url,
             json={"files": files},
             timeout=timeout,
+            headers=headers,
         )
     except requests.Timeout:
         raise AnalyzerTimeout(
@@ -104,7 +110,10 @@ def run_analysis(repository, files: list[dict], user=None) -> AnalysisRun:
         findings = payload.get("findings", [])
         _save_findings(run, findings)
         run.status = RunStatus.COMPLETED
-        run.summary = _build_summary(len(files), findings)
+        # Prefer Flask's own count: non-.py files were skipped, not analyzed.
+        meta = payload.get("meta") or {}
+        analyzed = meta.get("files_analyzed", len(files))
+        run.summary = _build_summary(analyzed, findings)
     except AnalyzerTimeout as exc:
         run.status = RunStatus.FAILED
         run.summary = str(exc)
@@ -140,6 +149,7 @@ def _save_findings(run: AnalysisRun, findings: list[dict]) -> None:
                 line_number=max(int(f.get("line_number") or 1), 1),
                 severity=f.get("severity", "info"),
                 rule=str(f.get("rule", ""))[:50],
+                source=str(f.get("source", ""))[:20],
                 description=str(f.get("description", ""))[:10000],
             )
         )

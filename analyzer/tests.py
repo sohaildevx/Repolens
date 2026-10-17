@@ -1,22 +1,26 @@
 """Tests for the Flask analyzer service.
 
 Run from the analyzer/ directory:
-    python -m pytest tests.py -v
-or:
     python -m unittest tests -v
 
 Covers:
-- valid request returns findings
-- invalid JSON / missing fields / oversized files / too many files
-- sensitive files (.env, *.pem) rejected
+- valid requests return normalized findings (file_path, line_number, rule,
+  severity, description, source)
+- source attribution per engine (ast / ruff / bandit)
+- invalid syntax handled as a finding, not a crash
+- unsupported (non-.py) files skipped gracefully
+- empty/malformed requests, oversized files, excessive file counts
+- sensitive files (.env, *.pem, id_rsa) rejected
 - path traversal / absolute paths rejected
-- AST detects eval/exec, bare except, syntax errors
-- Ruff and Bandit produce findings
+- tool timeouts surfaced as TOOL_TIMEOUT findings (no crash)
+- shared-secret token auth (X-Analyzer-Token)
 - health endpoint
 """
 
 import json
+import subprocess
 import unittest
+from unittest.mock import patch
 
 from app import app
 
@@ -27,11 +31,14 @@ class AnalyzerTestCase(unittest.TestCase):
     def setUp(self):
         self.client = app.test_client()
 
-    def _post(self, files):
+    def _post(self, files, token=None):
+        headers = {"Content-Type": "application/json"}
+        if token is not None:
+            headers["X-Analyzer-Token"] = token
         return self.client.post(
             "/analyze",
             data=json.dumps({"files": files}),
-            content_type="application/json",
+            headers=headers,
         )
 
 
@@ -47,6 +54,7 @@ class ValidRequestTests(AnalyzerTestCase):
         self.assertIn("findings", data)
         self.assertIn("meta", data)
         self.assertEqual(data["meta"]["files_submitted"], 1)
+        self.assertEqual(data["meta"]["files_analyzed"], 1)
 
     def test_eval_detected(self):
         resp = self._post([
@@ -73,14 +81,17 @@ class ValidRequestTests(AnalyzerTestCase):
         self.assertIn("AST001", rules)
 
     def test_finding_shape(self):
+        """Every finding carries all six documented fields."""
         resp = self._post([
             {"path": "bad.py", "content": "eval('2')\n"},
         ])
         data = resp.get_json()
+        self.assertTrue(data["findings"])
         for f in data["findings"]:
             for key in ("file_path", "line_number", "rule", "severity",
-                        "description"):
+                        "description", "source"):
                 self.assertIn(key, f)
+            self.assertIn(f["source"], {"ast", "ruff", "bandit"})
 
     def test_ruff_finds_issue(self):
         """Ruff should flag an unused import (F401)."""
@@ -104,6 +115,124 @@ class ValidRequestTests(AnalyzerTestCase):
             any(r.startswith("B1") for r in rules),
             f"Expected a Bandit B1xx finding, got: {rules}",
         )
+
+
+class SourceAttributionTests(AnalyzerTestCase):
+    """Each finding identifies which engine produced it."""
+
+    def _finding(self, rule):
+        resp = self._post([
+            {"path": "sample.py",
+             "content": "import os\npassword = 'hunter2'\nx = eval('1')\n"},
+        ])
+        self.assertEqual(resp.status_code, 200)
+        matches = [f for f in resp.get_json()["findings"] if f["rule"] == rule]
+        self.assertTrue(matches, f"rule {rule} not found")
+        return matches[0]
+
+    def test_ast_finding_source(self):
+        self.assertEqual(self._finding("AST002")["source"], "ast")
+
+    def test_ruff_finding_source(self):
+        self.assertEqual(self._finding("F401")["source"], "ruff")
+
+    def test_bandit_finding_source(self):
+        self.assertEqual(self._finding("B105")["source"], "bandit")
+
+
+class UnsupportedFileTests(AnalyzerTestCase):
+    """Non-.py files are skipped gracefully, not rejected or analyzed."""
+
+    def test_only_txt_file_returns_200_with_skip(self):
+        resp = self._post([
+            {"path": "README.md", "content": "# hello\n"},
+        ])
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(data["findings"], [])
+        self.assertEqual(data["meta"]["files_analyzed"], 0)
+        self.assertEqual(data["meta"]["files_submitted"], 1)
+        self.assertEqual(data["meta"]["skipped"],
+                         [{"path": "README.md", "reason": "not a Python file"}])
+
+    def test_mixed_files_analyze_only_python(self):
+        resp = self._post([
+            {"path": "app.py", "content": "eval('1')\n"},
+            {"path": "notes.txt", "content": "just text\n"},
+        ])
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(data["meta"]["files_analyzed"], 1)
+        self.assertEqual(data["meta"]["skipped"][0]["path"], "notes.txt")
+        # The .py file was still analyzed:
+        rules = [f["rule"] for f in data["findings"]]
+        self.assertIn("AST002", rules)
+        # And findings only reference the analyzed file:
+        self.assertEqual({f["file_path"] for f in data["findings"]},
+                         {"app.py"})
+
+
+class ToolFailureTests(AnalyzerTestCase):
+    """A dying/hung tool degrades to a TOOL_TIMEOUT finding, never a crash."""
+
+    @patch("analyzer.subprocess.run")
+    def test_tool_timeout_becomes_finding(self, mock_run):
+        mock_run.side_effect = subprocess.TimeoutExpired(
+            cmd="ruff", timeout=30
+        )
+        resp = self._post([
+            {"path": "ok.py", "content": "x = 1\n"},
+        ])
+        self.assertEqual(resp.status_code, 200)
+        findings = resp.get_json()["findings"]
+        timeout_findings = [f for f in findings
+                            if f["rule"] == "TOOL_TIMEOUT"]
+        # Both ruff and bandit runners reported the timeout:
+        self.assertEqual({f["source"] for f in timeout_findings},
+                         {"ruff", "bandit"})
+        for f in timeout_findings:
+            self.assertNotIn("Traceback", f["description"])
+
+    @patch("analyzer.subprocess.run")
+    def test_tool_crash_becomes_finding(self, mock_run):
+        mock_run.side_effect = OSError("boom")
+        resp = self._post([
+            {"path": "ok.py", "content": "x = 1\n"},
+        ])
+        self.assertEqual(resp.status_code, 200)
+        rules = [f["rule"] for f in resp.get_json()["findings"]]
+        self.assertIn("TOOL_ERROR", rules)
+
+
+class TokenAuthTests(AnalyzerTestCase):
+    """Shared-secret mode: with ANALYZER_TOKEN set, only the right token works."""
+
+    def setUp(self):
+        super().setUp()
+        self._saved = app.config["ANALYZER_TOKEN"]
+        app.config["ANALYZER_TOKEN"] = "s3cret-token"
+
+    def tearDown(self):
+        app.config["ANALYZER_TOKEN"] = self._saved
+
+    FILES = [{"path": "a.py", "content": "x = 1\n"}]
+
+    def test_missing_token_rejected_401(self):
+        resp = self._post(self.FILES)
+        self.assertEqual(resp.status_code, 401)
+
+    def test_wrong_token_rejected_401(self):
+        resp = self._post(self.FILES, token="wrong")
+        self.assertEqual(resp.status_code, 401)
+
+    def test_correct_token_accepted(self):
+        resp = self._post(self.FILES, token="s3cret-token")
+        self.assertEqual(resp.status_code, 200)
+
+    def test_health_stays_open(self):
+        """Liveness probes must not need the secret."""
+        resp = self.client.get("/health")
+        self.assertEqual(resp.status_code, 200)
 
 
 class InvalidInputTests(AnalyzerTestCase):
