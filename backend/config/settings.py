@@ -77,6 +77,17 @@ ANALYZER_TIMEOUT_SECONDS = int(os.environ.get('ANALYZER_TIMEOUT', '45'))
 # Both sides must read the SAME environment variable.
 ANALYZER_TOKEN = os.environ.get('ANALYZER_TOKEN', '')
 
+# NVIDIA Nemotron AI via Nebius Token Factory (OpenAI-compatible inference API).
+# Verified against the official docs quickstart (tokenfactory.nebius.com/docs):
+# base_url https://api.tokenfactory.nebius.com/v1/ + the official `openai` SDK.
+# SECURITY: values come from the environment ONLY -- never hardcoded, never
+# logged, never returned by any API. Missing values produce a safe
+# configuration error naming the variable (see analysis/ai_service.py).
+NEBIUS_API_KEY = os.environ.get('NEBIUS_API_KEY', '')
+NEBIUS_BASE_URL = os.environ.get('NEBIUS_BASE_URL', 'https://api.tokenfactory.nebius.com/v1/')
+NEBIUS_MODEL = os.environ.get('NEBIUS_MODEL', '')
+NEBIUS_TIMEOUT_SECONDS = int(os.environ.get('NEBIUS_TIMEOUT', '30'))
+
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',

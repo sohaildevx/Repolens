@@ -1,19 +1,28 @@
-"""Tests for the analysis app: models (Phase 3) + API endpoints (Phase 5)."""
+"""Tests for the analysis app: models (Phase 3), API (Phase 5), AI service."""
 
+import json
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
+import httpx2
 import requests as http_requests
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase, override_settings
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
 from repositories.models import Repository
 
+from .ai_service import (
+    AIConfigurationError,
+    AITimeout,
+    AIUnavailable,
+    chat_json,
+    is_configured,
+)
 from .models import (
     AgentRun,
     AnalysisRun,
@@ -714,3 +723,234 @@ class RepositoryAnalyzeEndpointTests(APITestCase):
         run = AnalysisRun.objects.get(pk=response.data["id"])
         self.assertEqual(run.status, RunStatus.FAILED)
         self.assertIsNotNone(run.completion_time)
+
+
+# ---------------------------------------------------------------------------
+# AI service (Nemotron via Nebius Token Factory): configuration safety and
+# error mapping. The OpenAI SDK is fully mocked -- no network, no credentials.
+# ---------------------------------------------------------------------------
+
+
+@override_settings(
+    NEBIUS_API_KEY="TEST-SECRET-KEY-MUST-NOT-LEAK",
+    NEBIUS_BASE_URL="https://api.tokenfactory.nebius.com/v1/",
+    NEBIUS_MODEL="nvidia/nemotron-3-super-120b-a12b",
+    NEBIUS_TIMEOUT_SECONDS=7,
+)
+class AIServiceConfigurationTests(SimpleTestCase):
+    """Config errors name variables -- never values. (No DB needed.)"""
+
+    KEY = "TEST-SECRET-KEY-MUST-NOT-LEAK"
+
+    @override_settings(NEBIUS_API_KEY="")
+    def test_missing_api_key_named_in_error(self):
+        with self.assertRaises(AIConfigurationError) as ctx:
+            chat_json("sys", "user")
+        msg = str(ctx.exception)
+        self.assertIn("NEBIUS_API_KEY", msg)
+        self.assertNotIn(self.KEY, msg)
+
+    @override_settings(NEBIUS_MODEL="")
+    def test_missing_model_named_and_key_never_leaked(self):
+        with self.assertRaises(AIConfigurationError) as ctx:
+            chat_json("sys", "user")
+        msg = str(ctx.exception)
+        self.assertIn("NEBIUS_MODEL", msg)
+        # The configured key value must never appear in any error text:
+        self.assertNotIn(self.KEY, msg)
+
+    @override_settings(NEBIUS_BASE_URL="")
+    def test_missing_base_url_named_in_error(self):
+        with self.assertRaises(AIConfigurationError) as ctx:
+            chat_json("sys", "user")
+        self.assertIn("NEBIUS_BASE_URL", str(ctx.exception))
+
+    @override_settings(NEBIUS_API_KEY="", NEBIUS_MODEL="")
+    def test_all_missing_names_listed_together(self):
+        with self.assertRaises(AIConfigurationError) as ctx:
+            chat_json("sys", "user")
+        msg = str(ctx.exception)
+        self.assertIn("NEBIUS_API_KEY", msg)
+        self.assertIn("NEBIUS_MODEL", msg)
+
+    def test_is_configured_true_when_complete(self):
+        self.assertTrue(is_configured())
+
+    @override_settings(NEBIUS_API_KEY="")
+    def test_is_configured_false_when_key_missing(self):
+        self.assertFalse(is_configured())
+
+    @patch("analysis.ai_service.OpenAI")
+    def test_error_before_any_client_construction(self, mock_openai):
+        """A config failure must not even build an SDK client."""
+        with override_settings(NEBIUS_API_KEY=""):
+            with self.assertRaises(AIConfigurationError):
+                chat_json("sys", "user")
+        mock_openai.assert_not_called()
+
+
+@override_settings(
+    NEBIUS_API_KEY="TEST-SECRET-KEY-MUST-NOT-LEAK",
+    NEBIUS_BASE_URL="https://api.tokenfactory.nebius.com/v1/",
+    NEBIUS_MODEL="nvidia/nemotron-3-super-120b-a12b",
+    NEBIUS_TIMEOUT_SECONDS=7,
+)
+class AIServiceCallTests(SimpleTestCase):
+    """Happy path + failure mapping with the OpenAI SDK fully mocked."""
+
+    KEY = "TEST-SECRET-KEY-MUST-NOT-LEAK"
+    MODEL = "nvidia/nemotron-3-super-120b-a12b"
+
+    @staticmethod
+    def _response(raw):
+        resp = MagicMock()
+        choice = MagicMock()
+        choice.message.content = raw
+        resp.choices = [choice]
+        return resp
+
+    @staticmethod
+    def _request():
+        return httpx2.Request(
+            "POST", "https://api.tokenfactory.nebius.com/v1/chat/completions"
+        )
+
+    @patch("analysis.ai_service.OpenAI")
+    def test_success_returns_parsed_json_and_wires_correct_client(self, mock_openai):
+        client = mock_openai.return_value
+        client.chat.completions.create.return_value = self._response(
+            json.dumps({"explanation": "use literal_eval", "confidence": 0.9})
+        )
+
+        result = chat_json("Return JSON.", "Fix eval()")
+
+        self.assertEqual(result,
+                         {"explanation": "use literal_eval", "confidence": 0.9})
+        # Client wired with credentials FROM SETTINGS, official base URL:
+        kwargs = mock_openai.call_args.kwargs
+        self.assertEqual(kwargs["api_key"], self.KEY)
+        self.assertEqual(kwargs["base_url"],
+                         "https://api.tokenfactory.nebius.com/v1/")
+        self.assertEqual(kwargs["timeout"], 7)
+        # Request goes to the exact configured model -- no silent fallback:
+        create_kwargs = client.chat.completions.create.call_args.kwargs
+        self.assertEqual(create_kwargs["model"], self.MODEL)
+        self.assertEqual(
+            [m["role"] for m in create_kwargs["messages"]],
+            ["system", "user"],
+        )
+        self.assertEqual(create_kwargs["response_format"],
+                         {"type": "json_object"})
+
+    @patch("analysis.ai_service.OpenAI")
+    def test_non_json_reply_is_safe_error(self, mock_openai):
+        mock_openai.return_value.chat.completions.create.return_value = \
+            self._response("definitely not json")
+        with self.assertRaises(AIUnavailable) as ctx:
+            chat_json("s", "u")
+        self.assertIn("valid JSON", str(ctx.exception))
+
+    @patch("analysis.ai_service.OpenAI")
+    def test_non_object_json_rejected(self, mock_openai):
+        mock_openai.return_value.chat.completions.create.return_value = \
+            self._response("[1, 2, 3]")
+        with self.assertRaises(AIUnavailable):
+            chat_json("s", "u")
+
+    @patch("analysis.ai_service.OpenAI")
+    def test_empty_reply_is_safe_error(self, mock_openai):
+        mock_openai.return_value.chat.completions.create.return_value = \
+            self._response("")
+        with self.assertRaises(AIUnavailable) as ctx:
+            chat_json("s", "u")
+        self.assertIn("empty", str(ctx.exception))
+
+    @patch("analysis.ai_service.OpenAI")
+    def test_auth_error_mapped_without_leaking_key(self, mock_openai):
+        mock_openai.return_value.chat.completions.create.side_effect = (
+            openai_auth_error()
+        )
+        with self.assertRaises(AIUnavailable) as ctx:
+            chat_json("s", "u")
+        msg = str(ctx.exception)
+        self.assertIn("NEBIUS_API_KEY", msg)
+        self.assertNotIn(self.KEY, msg)
+
+    @patch("analysis.ai_service.OpenAI")
+    def test_timeout_mapped_to_typed_error(self, mock_openai):
+        mock_openai.return_value.chat.completions.create.side_effect = (
+            openai_timeout_error()
+        )
+        with self.assertRaises(AITimeout) as ctx:
+            chat_json("s", "u")
+        self.assertIn("7 seconds", str(ctx.exception))
+
+    @patch("analysis.ai_service.OpenAI")
+    def test_connection_error_maps_to_unreachable(self, mock_openai):
+        import openai as openai_sdk
+
+        mock_openai.return_value.chat.completions.create.side_effect = (
+            openai_sdk.APIConnectionError(
+                message="Connection error.",
+                request=httpx2.Request("POST", "https://example.invalid"),
+            )
+        )
+        with self.assertRaises(AIUnavailable) as ctx:
+            chat_json("s", "u")
+        self.assertIn("unreachable", str(ctx.exception))
+
+    @patch("analysis.ai_service.OpenAI")
+    def test_rate_limit_maps_to_budget_message(self, mock_openai):
+        import openai as openai_sdk
+
+        mock_openai.return_value.chat.completions.create.side_effect = (
+            openai_sdk.RateLimitError(
+                "429",
+                response=httpx2.Response(
+                    429, request=httpx2.Request("POST", "https://x/v1")
+                ),
+                body=None,
+            )
+        )
+        with self.assertRaises(AIUnavailable) as ctx:
+            chat_json("s", "u")
+        self.assertIn("budget", str(ctx.exception))
+
+    @patch("analysis.ai_service.OpenAI")
+    def test_unexpected_exception_never_leaks_details(self, mock_openai):
+        mock_openai.return_value.chat.completions.create.side_effect = (
+            RuntimeError(f"boom details {self.KEY}")
+        )
+        with self.assertRaises(AIUnavailable) as ctx:
+            chat_json("s", "u")
+        msg = str(ctx.exception)
+        self.assertNotIn(self.KEY, msg)
+        self.assertNotIn("boom", msg)
+
+    @patch("analysis.ai_service.OpenAI")
+    def test_no_silent_fallback_on_missing_model(self, mock_openai):
+        """With the model unset, nothing is sent anywhere."""
+        with override_settings(NEBIUS_MODEL=""):
+            with self.assertRaises(AIConfigurationError):
+                chat_json("s", "u")
+        mock_openai.return_value.chat.completions.create.assert_not_called()
+
+
+def openai_auth_error():
+    import openai as openai_sdk
+
+    return openai_sdk.AuthenticationError(
+        "401 denied",
+        response=httpx2.Response(
+            401, request=httpx2.Request("POST", "https://x/v1")
+        ),
+        body=None,
+    )
+
+
+def openai_timeout_error():
+    import openai as openai_sdk
+
+    return openai_sdk.APITimeoutError(
+        request=httpx2.Request("POST", "https://x/v1")
+    )
