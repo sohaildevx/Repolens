@@ -139,6 +139,20 @@ class AgentRun(models.Model):
         default=0,
         help_text="How many repair tries the agent made in this run.",
     )
+    issue = models.ForeignKey(
+        Issue,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="agent_runs",        # issue.agent_runs.all()
+        help_text="Issue this run targets; nullable only for legacy rows.",
+    )
+    start_commit_sha = models.CharField(
+        max_length=40,
+        blank=True,
+        default="",
+        help_text="Git commit SHA the source snapshot was taken at, if known.",
+    )
     final_summary = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -188,6 +202,10 @@ class TestResult(models.Model):
     )
     test_name = models.CharField(max_length=255)
     status = models.CharField(max_length=10, choices=TestStatus.choices)
+    attempt = models.PositiveSmallIntegerField(
+        default=1,
+        help_text="Which repair attempt produced this result (1 or 2).",
+    )
     output = models.TextField(
         blank=True,
         help_text="Captured stdout/stderr; may be truncated later.",

@@ -22,11 +22,14 @@ from rest_framework.response import Response
 
 from repositories.models import Repository
 
-from .models import AnalysisRun, RunStatus
+from .models import AnalysisRun, AgentRun, CodeChange, Issue, RunStatus, TestResult
 from .serializers import (
+    AgentRunSerializer,
     AnalysisRequestSerializer,
     AnalysisRunSerializer,
     AnalyzeFilesSerializer,
+    CodeChangeSerializer,
+    TestResultSerializer,
 )
 from .services import run_analysis
 
@@ -122,3 +125,108 @@ class AnalysisRunDetailView(RetrieveAPIView):
             .filter(repository__owner=self.request.user)
             .select_related("repository")
         )
+
+
+def _owned_issue(user, issue_id):
+    """Return the user's issue, or None (caller answers 404).
+
+    Ownership is repository ownership, matching every other endpoint:
+    another user's issue is invisible, so IDs never leak between accounts.
+    """
+    return (
+        Issue.objects
+        .filter(pk=issue_id, analysis_run__repository__owner=user)
+        .select_related("analysis_run__repository")
+        .first()
+    )
+
+
+class AgentRunCreateView(CreateAPIView):
+    """POST /api/analysis/issues/<issue_id>/agent-run/ -- start a run.
+
+    Executes the agent workflow SYNCHRONOUSLY (there is no background-job
+    system in this project; runs are bounded by strict limits). On success
+    the response is 201 with the completed run; if the agent could not
+    produce a validated fix the run is still persisted with status=failed
+    and a safe summary, and the response is 200 so the record is visible.
+    """
+
+    permission_classes = [IsAuthenticated]
+    serializer_class = AgentRunSerializer
+
+    def create(self, request, issue_id=None, *args, **kwargs):
+        issue = _owned_issue(request.user, issue_id)
+        if issue is None:
+            return Response(
+                {"detail": "Issue not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        # Imported here so a circular import at module load is impossible.
+        from .agent_service import run_agent
+
+        agent_run = run_agent(issue)
+        serializer = self.get_serializer(agent_run)
+        if agent_run.status == RunStatus.FAILED:
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class AgentRunOwnedMixin:
+    """Shared queryset: only runs belonging to the requesting user."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get_agent_run(self):
+        return (
+            AgentRun.objects
+            .filter(
+                pk=self.kwargs["pk"],
+                analysis_run__repository__owner=self.request.user,
+            )
+            .select_related("analysis_run__repository", "issue")
+            .first()
+        )
+
+    def _not_found(self):
+        return Response(
+            {"detail": "Agent run not found."},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+
+class AgentRunDetailView(AgentRunOwnedMixin, RetrieveAPIView):
+    """GET /api/agent-runs/<id>/ -- status, attempts, checks, summary."""
+
+    serializer_class = AgentRunSerializer
+
+    def get(self, request, pk=None, *args, **kwargs):
+        agent_run = self.get_agent_run()
+        if agent_run is None:
+            return self._not_found()
+        return Response(self.get_serializer(agent_run).data)
+
+
+class AgentRunChangesView(AgentRunOwnedMixin, RetrieveAPIView):
+    """GET /api/agent-runs/<id>/changes/ -- proposed diffs for the run."""
+
+    serializer_class = CodeChangeSerializer
+
+    def get(self, request, pk=None, *args, **kwargs):
+        agent_run = self.get_agent_run()
+        if agent_run is None:
+            return self._not_found()
+        changes = agent_run.code_changes.all()
+        return Response(self.get_serializer(changes, many=True).data)
+
+
+class AgentRunTestsView(AgentRunOwnedMixin, RetrieveAPIView):
+    """GET /api/agent-runs/<id>/tests/ -- validation & test results."""
+
+    serializer_class = TestResultSerializer
+
+    def get(self, request, pk=None, *args, **kwargs):
+        agent_run = self.get_agent_run()
+        if agent_run is None:
+            return self._not_found()
+        results = agent_run.test_results.order_by("attempt", "test_name")
+        return Response(self.get_serializer(results, many=True).data)

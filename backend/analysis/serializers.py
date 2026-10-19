@@ -16,7 +16,7 @@ Two request shapes are supported:
 
 from rest_framework import serializers
 
-from .models import AnalysisRun, Issue
+from .models import AnalysisRun, AgentRun, CodeChange, Issue, TestResult
 
 # Keep these aligned with analyzer/analyzer.py (mirrored on purpose).
 MAX_FILES = 100
@@ -28,7 +28,7 @@ SENSITIVE_PATTERNS = {
     ".env", ".env.local", ".env.production",
     "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
     "credentials", "credentials.json", "secrets.json",
-    "service-account.json", ".npmrc", ".pypirc",
+    "secrets", "service-account.json", ".npmrc", ".pypirc",
 }
 SENSITIVE_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".keystore")
 
@@ -148,4 +148,58 @@ class AnalysisRunSerializer(serializers.ModelSerializer):
             "created_at",
             "issues",
         )
+        read_only_fields = fields
+
+
+class AgentRunSerializer(serializers.ModelSerializer):
+    """Read-only agent-run detail.
+
+    `issue_id` exposes which issue the run targets; `checks` gives a quick
+    overview without downloading every TestResult row.
+    """
+
+    issue_id = serializers.IntegerField(
+        read_only=True, allow_null=True
+    )
+    checks = serializers.SerializerMethodField()
+
+    class Meta:
+        model = AgentRun
+        fields = (
+            "id",
+            "analysis_run",
+            "issue_id",
+            "status",
+            "repair_attempts",
+            "start_commit_sha",
+            "final_summary",
+            "checks",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = fields
+
+    def get_checks(self, obj):
+        results = obj.test_results.values_list("status", flat=True)
+        counts = {"passed": 0, "failed": 0, "error": 0, "skipped": 0}
+        for s in results:
+            counts[s] = counts.get(s, 0) + 1
+        return counts
+
+
+class CodeChangeSerializer(serializers.ModelSerializer):
+    """Read-only proposed change (one per modified file)."""
+
+    class Meta:
+        model = CodeChange
+        fields = ("id", "file_path", "proposed_diff", "created_at")
+        read_only_fields = fields
+
+
+class TestResultSerializer(serializers.ModelSerializer):
+    """Read-only validation/test result, including which attempt ran it."""
+
+    class Meta:
+        model = TestResult
+        fields = ("id", "test_name", "status", "attempt", "output", "created_at")
         read_only_fields = fields

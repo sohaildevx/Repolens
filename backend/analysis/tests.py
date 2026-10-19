@@ -15,6 +15,7 @@ from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
 from repositories.models import Repository
+from repositories.services import GitHubRateLimited, GitHubRepoNotFound
 
 from .ai_service import (
     AIConfigurationError,
@@ -954,3 +955,746 @@ def openai_timeout_error():
     return openai_sdk.APITimeoutError(
         request=httpx2.Request("POST", "https://x/v1")
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 7 -- Agent run (autonomous bug fixing) tests
+# ---------------------------------------------------------------------------
+
+import base64 as _base64
+import os as _os
+import tempfile as _tempfile
+from types import SimpleNamespace as _NS
+
+from . import sandbox as _sandbox_module
+from .agent_service import run_agent
+from .patching import PatchError, apply_patch, make_diff, parse_patch
+from .sandbox import SandboxConfigurationError, SandboxResult, build_run_command
+from .snapshot import Snapshot, SnapshotError, fetch_github_snapshot, is_sensitive_path
+
+BUGGY_SOURCE = "def add(a, b):\n    return a - b\n"
+FIXED_SOURCE = "def add(a, b):\n    return a + b\n"
+GOOD_PATCH = {"path": "app.py", "old_code": "return a - b", "new_code": "return a + b"}
+CLEAN_ANALYZER = {"summary": "clean", "files_analyzed": 1, "issues": []}
+
+# Sentinel: distinguishes "no sandbox argument" (use default) from an
+# explicit None (sandbox unavailable).
+_SENTINEL = object()
+
+
+def make_snapshot(files=None):
+    return Snapshot(
+        owner="octo",
+        repo="hello",
+        commit_sha="a" * 40,
+        files=files if files is not None else {"app.py": BUGGY_SOURCE},
+    )
+
+
+def agent_detail_url(pk):
+    return f"/api/agent-runs/{pk}/"
+
+
+def agent_changes_url(pk):
+    return f"/api/agent-runs/{pk}/changes/"
+
+
+def agent_tests_url(pk):
+    return f"/api/agent-runs/{pk}/tests/"
+
+
+def agent_run_url_for_issue(issue_id):
+    return f"/api/analysis/issues/{issue_id}/agent-run/"
+
+
+class AgentFixtureMixin:
+    """Shared fixtures: user, repo, analysis run, one issue in app.py."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create_user(
+            username="alice", email="alice@example.com", password="Str0ng-Pass!x"
+        )
+        cls.other = User.objects.create_user(
+            username="bob", email="bob@example.com", password="Str0ng-Pass!x"
+        )
+        cls.repo = Repository.objects.create(
+            owner=cls.user,
+            github_url="https://github.com/octo/hello",
+            name="hello",
+        )
+        cls.analysis_run = AnalysisRun.objects.create(repository=cls.repo)
+        cls.issue = Issue.objects.create(
+            analysis_run=cls.analysis_run,
+            file_path="app.py",
+            line_number=2,
+            severity=Severity.LOW,
+            rule="AST001",
+            source="ast",
+            description="add() subtracts instead of adding.",
+        )
+
+
+class PatchingUnitTests(SimpleTestCase):
+    """parse_patch / apply_patch / make_diff: untrusted-patch validation."""
+
+    def test_valid_patch_parses(self):
+        patch = parse_patch(GOOD_PATCH, make_snapshot())
+        self.assertEqual(patch["path"], "app.py")
+
+    def test_non_dict_reply_rejected(self):
+        with self.assertRaises(PatchError):
+            parse_patch(["not", "a", "dict"], make_snapshot())
+
+    def test_path_traversal_rejected(self):
+        bad = dict(GOOD_PATCH, path="../evil.py")
+        with self.assertRaises(PatchError):
+            parse_patch(bad, make_snapshot())
+
+    def test_absolute_path_rejected(self):
+        bad = dict(GOOD_PATCH, path="/etc/passwd.py")
+        with self.assertRaises(PatchError):
+            parse_patch(bad, make_snapshot())
+
+    def test_backslash_path_rejected(self):
+        bad = dict(GOOD_PATCH, path="src\\evil.py")
+        with self.assertRaises(PatchError):
+            parse_patch(bad, make_snapshot())
+
+    def test_non_python_file_rejected(self):
+        snap = make_snapshot({"README.md": "hi"})
+        bad = dict(GOOD_PATCH, path="README.md")
+        with self.assertRaises(PatchError):
+            parse_patch(bad, snap)
+
+    def test_sensitive_path_rejected(self):
+        snap = make_snapshot({".env.py": "SECRET = 1\n"})
+        bad = dict(GOOD_PATCH, path=".env.py")
+        with self.assertRaises(PatchError):
+            parse_patch(bad, snap)
+
+    def test_path_outside_snapshot_rejected(self):
+        with self.assertRaises(PatchError):
+            parse_patch(GOOD_PATCH, make_snapshot({"other.py": "x = 1\n"}))
+
+    def test_empty_old_code_rejected(self):
+        bad = dict(GOOD_PATCH, old_code="   ")
+        with self.assertRaises(PatchError):
+            parse_patch(bad, make_snapshot())
+
+    def test_identical_new_code_rejected(self):
+        bad = dict(GOOD_PATCH, new_code="return a - b")
+        with self.assertRaises(PatchError):
+            parse_patch(bad, make_snapshot())
+
+    def test_old_code_not_in_file_rejected(self):
+        bad = dict(GOOD_PATCH, old_code="return a * b")
+        with self.assertRaises(PatchError):
+            parse_patch(bad, make_snapshot())
+
+    def test_ambiguous_old_code_rejected(self):
+        dup = "x = 1\ny = 2\n"
+        snap = make_snapshot({"app.py": dup + dup})
+        bad = {"path": "app.py", "old_code": "x = 1", "new_code": "x = 2"}
+        with self.assertRaises(PatchError):
+            parse_patch(bad, snap)
+
+    def test_make_diff_has_headers_and_change(self):
+        diff = make_diff("app.py", BUGGY_SOURCE, FIXED_SOURCE)
+        self.assertIn("--- a/app.py", diff)
+        self.assertIn("+++ b/app.py", diff)
+        self.assertIn("-    return a - b", diff)
+        self.assertIn("+    return a + b", diff)
+
+    def test_make_diff_truncates_huge_output(self):
+        big_before = "\n".join(f"line {i}" for i in range(5000))
+        big_after = "\n".join(f"changed {i}" for i in range(5000))
+        diff = make_diff("app.py", big_before, big_after)
+        self.assertLessEqual(len(diff), 20_000 + 100)
+        self.assertIn("[diff truncated]", diff)
+
+    def test_apply_patch_writes_workspace_only(self):
+        with _tempfile.TemporaryDirectory() as tmp:
+            target = _os.path.join(tmp, "app.py")
+            with open(target, "w", encoding="utf-8") as fh:
+                fh.write(BUGGY_SOURCE)
+            updated = apply_patch(
+                _os.path.join(tmp), "app.py", "return a - b", "return a + b"
+            )
+            self.assertIn("return a + b", updated)
+            with open(target, encoding="utf-8") as fh:
+                self.assertIn("return a + b", fh.read())
+
+    def test_apply_patch_refuses_workspace_escape(self):
+        with _tempfile.TemporaryDirectory() as tmp:
+            with _tempfile.TemporaryDirectory() as outside:
+                victim = _os.path.join(outside, "victim.py")
+                with open(victim, "w", encoding="utf-8") as fh:
+                    fh.write(BUGGY_SOURCE)
+                escape = "../" + _os.path.basename(outside) + "/victim.py"
+                with self.assertRaises(PatchError):
+                    apply_patch(tmp, escape, "return a - b", "return a + b")
+                with open(victim, encoding="utf-8") as fh:
+                    self.assertEqual(fh.read(), BUGGY_SOURCE)
+
+    def test_apply_patch_missing_file_rejected(self):
+        with _tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(PatchError):
+                apply_patch(tmp, "missing.py", "a", "b")
+
+    def test_apply_patch_stale_old_code_rejected(self):
+        with _tempfile.TemporaryDirectory() as tmp:
+            with open(_os.path.join(tmp, "app.py"), "w", encoding="utf-8") as fh:
+                fh.write(FIXED_SOURCE)
+            with self.assertRaises(PatchError):
+                apply_patch(tmp, "app.py", "return a - b", "return a + b")
+
+
+class SandboxUnitTests(SimpleTestCase):
+    """Docker sandbox: restrictions, disabled paths, timeout cleanup."""
+
+    def test_command_includes_all_restrictions(self):
+        cmd = build_run_command("docker", "n1", "/tmp/ws", "python:3.12-slim", "65534")
+        joined = " ".join(cmd)
+        for flag in (
+            "--rm",
+            "--network=none",
+            "--read-only",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges",
+            "--user=65534",
+            "--pids-limit=",
+            "--memory=",
+            "--cpus=",
+        ):
+            self.assertIn(flag, joined)
+        # The command tail is exactly the allowlisted unittest invocation.
+        self.assertEqual(
+            tuple(cmd[-len(_sandbox_module.ALLOWED_COMMANDS[0]):]),
+            _sandbox_module.ALLOWED_COMMANDS[0],
+        )
+
+    def test_command_never_allows_git_pip_or_shell(self):
+        cmd = build_run_command("docker", "n1", "/tmp/ws", "img", "65534")
+        joined = " ".join(cmd)
+        for forbidden in ("git", "push", "pip", "curl", "bash", "sh ", "cmd"):
+            self.assertNotIn(forbidden, joined)
+
+    def test_root_user_refused(self):
+        with self.assertRaises(SandboxConfigurationError):
+            build_run_command("docker", "n1", "/tmp/ws", "img", "0")
+        with self.assertRaises(SandboxConfigurationError):
+            build_run_command("docker", "n1", "/tmp/ws", "img", "root")
+
+    @override_settings(AGENT_TEST_EXECUTION=False)
+    def test_disabled_by_default_returns_none(self):
+        self.assertIsNone(_sandbox_module.run_tests("/tmp/ws"))
+
+    @override_settings(AGENT_TEST_EXECUTION=True)
+    def test_returns_none_without_docker_daemon(self):
+        with patch("analysis.sandbox.docker_available", return_value=False):
+            self.assertIsNone(_sandbox_module.run_tests("/tmp/ws"))
+
+    @override_settings(AGENT_TEST_EXECUTION=True)
+    def test_returns_none_when_image_missing(self):
+        with patch("analysis.sandbox.docker_available", return_value=True), \
+                patch("analysis.sandbox.image_present", return_value=False):
+            self.assertIsNone(_sandbox_module.run_tests("/tmp/ws"))
+
+    @override_settings(
+        AGENT_TEST_EXECUTION=True, SANDBOX_TIMEOUT_SECONDS=5
+    )
+    def test_timeout_is_reported_and_container_removed(self):
+        import subprocess as _sp
+
+        with patch("analysis.sandbox.docker_available", return_value=True), \
+                patch("analysis.sandbox.image_present", return_value=True), \
+                patch("analysis.sandbox.shutil.which", return_value="docker"), \
+                patch(
+                    "analysis.sandbox.subprocess.run",
+                    side_effect=_sp.TimeoutExpired(cmd="docker", timeout=5),
+                ) as mock_run:
+            result = _sandbox_module.run_tests("/tmp/ws")
+        self.assertIsNotNone(result)
+        self.assertTrue(result.timed_out)
+        self.assertIn("timed out", result.output)
+        # Cleanup must have been attempted despite the timeout.
+        cleanup_calls = [
+            c for c in mock_run.call_args_list if "rm" in c.args[0]
+        ]
+        self.assertTrue(cleanup_calls)
+
+    @override_settings(AGENT_TEST_EXECUTION=True)
+    def test_start_failure_is_reported_safely(self):
+        with patch("analysis.sandbox.docker_available", return_value=True), \
+                patch("analysis.sandbox.image_present", return_value=True), \
+                patch("analysis.sandbox.shutil.which", return_value="docker"), \
+                patch(
+                    "analysis.sandbox.subprocess.run",
+                    side_effect=OSError("no daemon"),
+                ):
+            result = _sandbox_module.run_tests("/tmp/ws")
+        self.assertIsNotNone(result)
+        self.assertIsNone(result.returncode)
+        self.assertIn("failed to start", result.output)
+
+    @override_settings(AGENT_TEST_EXECUTION=True)
+    def test_nonzero_exit_reports_failure(self):
+        ok = _NS(returncode=0, stdout="ok", stderr="")
+        rm = _NS(returncode=0, stdout="", stderr="")
+        failed = _NS(returncode=1, stdout="", stderr="FAILED (1 test)")
+        with patch("analysis.sandbox.docker_available", return_value=True), \
+                patch("analysis.sandbox.image_present", return_value=True), \
+                patch("analysis.sandbox.shutil.which", return_value="docker"), \
+                patch("analysis.sandbox.subprocess.run", side_effect=[failed, rm]):
+            result = _sandbox_module.run_tests("/tmp/ws")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("FAILED", result.output)
+
+
+class _FakeResponse:
+    def __init__(self, status_code=200, data=None, headers=None):
+        self.status_code = status_code
+        self._data = data or {}
+        self.headers = headers or {}
+
+    def json(self):
+        return self._data
+
+
+def _fake_github(responses):
+    """A fake requests.Session whose .get() walks through `responses`."""
+    session = _NS()
+    session.headers = {}
+    session.get = MagicMock(
+        side_effect=[_FakeResponse(**r) if isinstance(r, dict) else r
+                     for r in responses]
+    )
+    return session
+
+
+class SnapshotUnitTests(SimpleTestCase):
+    """Snapshot fetching: exclusions, limits, GitHub error taxonomy."""
+
+    def test_sensitive_path_detection(self):
+        for p in (".env", "src/.env.local", "id_rsa", "keys/server.pem",
+                  "cfg/credentials"):
+            self.assertTrue(is_sensitive_path(p), p)
+        for p in ("app.py", "src/main.py", "environment.py"):
+            self.assertFalse(is_sensitive_path(p), p)
+
+    def test_fetch_happy_path_records_commit_sha(self):
+        blob = _base64.b64encode(BUGGY_SOURCE.encode()).decode()
+        responses = [
+            dict(data={"default_branch": "main"}),
+            dict(data={"sha": "c" * 40}),
+            dict(data={"truncated": False, "tree": [
+                {"type": "blob", "path": "app.py", "sha": "b1", "size": 40},
+            ]}),
+            dict(data={"encoding": "base64", "content": blob}),
+        ]
+        with patch("analysis.snapshot.requests.Session",
+                   return_value=_fake_github(responses)):
+            snap = fetch_github_snapshot(
+                _NS(github_url="https://github.com/octo/hello")
+            )
+        self.assertEqual(snap.commit_sha, "c" * 40)
+        self.assertEqual(snap.files["app.py"], BUGGY_SOURCE)
+        self.assertEqual(snap.skipped, [])
+
+    def test_fetch_excludes_sensitive_oversized_and_non_python(self):
+        blob = _base64.b64encode(BUGGY_SOURCE.encode()).decode()
+        responses = [
+            dict(data={"default_branch": "main"}),
+            dict(data={"sha": "c" * 40}),
+            dict(data={"truncated": False, "tree": [
+                {"type": "blob", "path": "secrets.py", "sha": "sec", "size": 10},
+                {"type": "blob", "path": "README.md", "sha": "x", "size": 10},
+                {"type": "blob", "path": "big.py", "sha": "x",
+                 "size": 10_000_000},
+                {"type": "blob", "path": "app.py", "sha": "b1", "size": 40},
+            ]}),
+            # Only app.py is downloaded; id_rsa.py is excluded, never fetched.
+            dict(data={"encoding": "base64", "content": blob}),
+        ]
+        with patch("analysis.snapshot.requests.Session",
+                   return_value=_fake_github(responses)):
+            snap = fetch_github_snapshot(
+                _NS(github_url="https://github.com/octo/hello")
+            )
+        self.assertEqual(set(snap.files), {"app.py"})
+        self.assertNotIn("secrets.py", snap.files)
+        self.assertTrue(any("secrets.py" in s for s in snap.skipped))
+        self.assertTrue(any("big.py" in s for s in snap.skipped))
+        # Non-.py files are filtered by extension and are not "skipped".
+        self.assertFalse(any("README" in s for s in snap.skipped))
+
+    def test_fetch_maps_404_to_safe_error(self):
+        with patch("analysis.snapshot.requests.Session",
+                   return_value=_fake_github([dict(status_code=404)])):
+            with self.assertRaises(GitHubRepoNotFound):
+                fetch_github_snapshot(
+                    _NS(github_url="https://github.com/octo/hello")
+                )
+
+    def test_fetch_maps_rate_limit_to_safe_error(self):
+        with patch("analysis.snapshot.requests.Session",
+                   return_value=_fake_github([dict(status_code=429)])):
+            with self.assertRaises(GitHubRateLimited):
+                fetch_github_snapshot(
+                    _NS(github_url="https://github.com/octo/hello")
+                )
+
+    def test_fetch_without_python_files_raises(self):
+        responses = [
+            dict(data={"default_branch": "main"}),
+            dict(data={"sha": "c" * 40}),
+            dict(data={"truncated": False, "tree": [
+                {"type": "blob", "path": "README.md", "sha": "x", "size": 10},
+            ]}),
+        ]
+        with patch("analysis.snapshot.requests.Session",
+                   return_value=_fake_github(responses)):
+            with self.assertRaises(SnapshotError):
+                fetch_github_snapshot(
+                    _NS(github_url="https://github.com/octo/hello")
+                )
+
+    def test_invalid_github_url_raises_snapshot_error(self):
+        with self.assertRaises(SnapshotError):
+            fetch_github_snapshot(_NS(github_url="https://evil.com/x"))
+
+
+@override_settings(AGENT_TEST_EXECUTION=False)
+class AgentServiceTests(AgentFixtureMixin, TestCase):
+    """Full lifecycle with snapshot, AI, analyzer and sandbox mocked."""
+
+    def _run_with(self, snapshot=None, chat=None, analyzer=None,
+                  sandbox=_SENTINEL):
+        """Drive run_agent with all externals mocked.
+
+        - chat / analyzer: a dict -> single return value; a list -> a
+          sequence of per-attempt values (side_effect).
+        - sandbox: _SENTINEL -> default passing result; None -> sandbox
+          unavailable; a list -> per-attempt results.
+        """
+        snap = snapshot or make_snapshot()
+        chat_kw = (
+            {"side_effect": chat} if isinstance(chat, list)
+            else {"return_value": chat or GOOD_PATCH}
+        )
+        analyzer_kw = (
+            {"side_effect": analyzer} if isinstance(analyzer, list)
+            else {"return_value": analyzer or CLEAN_ANALYZER}
+        )
+        if sandbox is _SENTINEL:
+            sandbox_kw = {"return_value": SandboxResult(0, "OK")}
+        elif isinstance(sandbox, list):
+            sandbox_kw = {"side_effect": sandbox}
+        else:
+            sandbox_kw = {"return_value": sandbox}
+        with patch(
+            "analysis.agent_service.fetch_github_snapshot", return_value=snap
+        ), patch(
+            "analysis.agent_service.chat_json", **chat_kw
+        ), patch(
+            "analysis.agent_service.call_analyzer", **analyzer_kw
+        ), patch(
+            "analysis.sandbox.run_tests", **sandbox_kw
+        ):
+            return run_agent(self.issue)
+
+    def test_successful_run_completes_and_persists(self):
+        run = self._run_with()
+        self.assertEqual(run.status, RunStatus.COMPLETED)
+        self.assertEqual(run.repair_attempts, 1)
+        self.assertEqual(run.start_commit_sha, "a" * 40)
+        self.assertIn("attempt 1", run.final_summary)
+
+        changes = list(run.code_changes.all())
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0].file_path, "app.py")
+        self.assertIn("+    return a + b", changes[0].proposed_diff)
+
+        results = {r.test_name: r.status for r in run.test_results.all()}
+        self.assertEqual(results["syntax:app.py"], TestStatus.PASSED)
+        self.assertEqual(results["static-analysis"], TestStatus.PASSED)
+        self.assertEqual(results["tests"], TestStatus.PASSED)
+
+    def test_original_workspace_not_required_after_run(self):
+        # The temp workspace must be gone; nothing may persist on disk.
+        run = self._run_with()
+        self.assertEqual(run.status, RunStatus.COMPLETED)
+
+    def test_snapshot_failure_fails_run_without_ai_call(self):
+        from repositories.services import GitHubRepoNotFound
+
+        with patch(
+            "analysis.agent_service.fetch_github_snapshot",
+            side_effect=GitHubRepoNotFound("Repository not found or is private."),
+        ), patch("analysis.agent_service.chat_json") as mock_chat:
+            run = run_agent(self.issue)
+        self.assertEqual(run.status, RunStatus.FAILED)
+        self.assertIn("Snapshot failed", run.final_summary)
+        mock_chat.assert_not_called()
+        self.assertEqual(run.start_commit_sha, "")
+
+    def test_issue_file_missing_from_snapshot_fails(self):
+        snap = make_snapshot({"other.py": "x = 1\n"})
+        run = self._run_with(snapshot=snap)
+        self.assertEqual(run.status, RunStatus.FAILED)
+        self.assertIn("not present in the fetched snapshot", run.final_summary)
+
+    def test_invalid_ai_patch_gets_one_retry_then_fails(self):
+        bad = {"path": "nope.py", "old_code": "x", "new_code": "y"}
+        run = self._run_with(chat=[bad, bad])
+        self.assertEqual(run.status, RunStatus.FAILED)
+        self.assertEqual(run.repair_attempts, 2)
+        self.assertIn("invalid AI patch", run.final_summary)
+        self.assertEqual(run.code_changes.count(), 0)
+
+    def test_retry_after_invalid_patch_succeeds(self):
+        bad = {"path": "nope.py", "old_code": "x", "new_code": "y"}
+        run = self._run_with(chat=[bad, GOOD_PATCH])
+        self.assertEqual(run.status, RunStatus.COMPLETED)
+        self.assertEqual(run.repair_attempts, 2)
+        self.assertIn("after one repair retry", run.final_summary)
+
+    def test_ai_transport_error_fails_immediately_without_retry(self):
+        with patch(
+            "analysis.agent_service.fetch_github_snapshot",
+            return_value=make_snapshot(),
+        ), patch(
+            "analysis.agent_service.chat_json",
+            side_effect=AIUnavailable("AI service is unreachable."),
+        ) as mock_chat:
+            run = run_agent(self.issue)
+        self.assertEqual(run.status, RunStatus.FAILED)
+        self.assertIn("AI request failed", run.final_summary)
+        # The fixed, credential-free client message is surfaced verbatim.
+        self.assertIn("AI service is unreachable", run.final_summary)
+        mock_chat.assert_called_once()
+
+    def test_static_failure_then_clean_retry_completes(self):
+        dirty = {
+            "summary": "1 issue", "files_analyzed": 1,
+            "issues": [{"file_path": "app.py", "line_number": 1,
+                        "severity": "low", "source": "ruff",
+                        "rule": "E1", "description": "style"}],
+        }
+        run = self._run_with(analyzer=[dirty, CLEAN_ANALYZER])
+        self.assertEqual(run.status, RunStatus.COMPLETED)
+        self.assertEqual(run.repair_attempts, 2)
+        statuses = [
+            (r.test_name, r.status) for r in run.test_results.all()
+        ]
+        self.assertIn(("static-analysis", TestStatus.FAILED), statuses)
+        self.assertIn(("static-analysis", TestStatus.PASSED), statuses)
+
+    def test_static_failure_on_both_attempts_fails_run(self):
+        dirty = {
+            "summary": "1 issue", "files_analyzed": 1,
+            "issues": [{"file_path": "app.py", "line_number": 1,
+                        "severity": "low", "source": "ruff",
+                        "rule": "E1", "description": "style"}],
+        }
+        run = self._run_with(analyzer=[dirty, dirty])
+        self.assertEqual(run.status, RunStatus.FAILED)
+        self.assertEqual(run.repair_attempts, 2)
+        self.assertIn("static-analysis", run.final_summary)
+
+    def test_analyzer_error_fails_without_retry(self):
+        with patch(
+            "analysis.agent_service.fetch_github_snapshot",
+            return_value=make_snapshot(),
+        ), patch(
+            "analysis.agent_service.chat_json", return_value=GOOD_PATCH
+        ), patch(
+            "analysis.agent_service.call_analyzer",
+            side_effect=AnalyzerUnavailable("Analyzer is down."),
+        ) as mock_call:
+            run = run_agent(self.issue)
+        self.assertEqual(run.status, RunStatus.FAILED)
+        self.assertEqual(run.repair_attempts, 1)
+        mock_call.assert_called_once()
+        results = {r.test_name: r.status for r in run.test_results.all()}
+        self.assertEqual(results["static-analysis"], TestStatus.ERROR)
+
+    def test_syntax_broken_patch_fails_and_retries(self):
+        broken = dict(GOOD_PATCH, new_code="def add(a, b:\n    return 0\n")
+        run = self._run_with(chat=[broken, broken])
+        self.assertEqual(run.status, RunStatus.FAILED)
+        self.assertEqual(run.repair_attempts, 2)
+        results = {r.test_name: r.status for r in run.test_results.all()}
+        self.assertEqual(results["syntax:app.py"], TestStatus.FAILED)
+
+    def test_sandbox_unavailable_records_skipped_and_completes(self):
+        run = self._run_with(sandbox=None)
+        self.assertEqual(run.status, RunStatus.COMPLETED)
+        tests_row = run.test_results.get(test_name="tests")
+        self.assertEqual(tests_row.status, TestStatus.SKIPPED)
+        self.assertIn("NOT run", tests_row.output)
+        self.assertIn("were not executed", run.final_summary.lower())
+
+    def test_failing_tests_then_passing_retry(self):
+        first = SandboxResult(1, "FAILED (test_add)")
+        second = SandboxResult(0, "OK")
+        run = self._run_with(sandbox=[first, second])
+        self.assertEqual(run.status, RunStatus.COMPLETED)
+        self.assertEqual(run.repair_attempts, 2)
+        rows = [
+            (r.attempt, r.status) for r in
+            run.test_results.filter(test_name="tests")
+        ]
+        self.assertIn((1, TestStatus.FAILED), rows)
+        self.assertIn((2, TestStatus.PASSED), rows)
+
+    def test_workspace_is_deleted_after_run(self):
+        real_mkdtemp = _tempfile.mkdtemp
+        created = []
+
+        def tracking_mkdtemp(*args, **kwargs):
+            path = real_mkdtemp(*args, **kwargs)
+            created.append(path)
+            return path
+
+        with patch("analysis.agent_service.tempfile.mkdtemp",
+                   side_effect=tracking_mkdtemp):
+            run = self._run_with()
+        self.assertEqual(run.status, RunStatus.COMPLETED)
+        self.assertEqual(len(created), 1)
+        self.assertFalse(_os.path.exists(created[0]))
+
+    def test_no_git_commands_anywhere_in_sandbox_layer(self):
+        for command in _sandbox_module.ALLOWED_COMMANDS:
+            self.assertNotIn("git", command)
+            self.assertEqual(tuple(command[:3]), ("python", "-m", "unittest"))
+
+
+class AgentRunAPITests(AgentFixtureMixin, APITestCase):
+    """Endpoints: authentication, ownership, status codes, shapes."""
+
+    def _finished_run(self, run_status=RunStatus.COMPLETED):
+        return AgentRun.objects.create(
+            analysis_run=self.analysis_run,
+            issue=self.issue,
+            status=run_status,
+            repair_attempts=1,
+            start_commit_sha="a" * 40,
+            final_summary="Fix validated on attempt 1.",
+        )
+
+    def test_create_requires_authentication(self):
+        response = self.client.post(agent_run_url_for_issue(self.issue.pk))
+        self.assertIn(
+            response.status_code,
+            (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN),
+        )
+
+    def test_detail_change_test_endpoints_require_authentication(self):
+        run = self._finished_run()
+        for url in (agent_detail_url(run.pk), agent_changes_url(run.pk),
+                    agent_tests_url(run.pk)):
+            response = self.client.get(url)
+            self.assertIn(
+                response.status_code,
+                (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN),
+            )
+
+    def test_create_agent_run_success(self):
+        self.client.force_authenticate(user=self.user)
+        finished = self._finished_run()
+        with patch("analysis.agent_service.run_agent",
+                   return_value=finished) as mock_run:
+            response = self.client.post(agent_run_url_for_issue(self.issue.pk))
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        mock_run.assert_called_once()
+        data = response.json()
+        self.assertEqual(data["status"], RunStatus.COMPLETED)
+        self.assertEqual(data["repair_attempts"], 1)
+        self.assertEqual(data["start_commit_sha"], "a" * 40)
+        self.assertIn("checks", data)
+
+    def test_create_agent_run_failed_returns_200_with_record(self):
+        self.client.force_authenticate(user=self.user)
+        failed = self._finished_run(run_status=RunStatus.FAILED)
+        failed.final_summary = "Validation failed after 2 attempt(s)."
+        failed.save()
+        with patch("analysis.agent_service.run_agent",
+                   return_value=failed):
+            response = self.client.post(agent_run_url_for_issue(self.issue.pk))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["status"], RunStatus.FAILED)
+
+    def test_create_agent_run_foreign_issue_404(self):
+        self.client.force_authenticate(user=self.other)
+        response = self.client.post(agent_run_url_for_issue(self.issue.pk))
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_create_agent_run_invalid_id_404(self):
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post(agent_run_url_for_issue(999999))
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_detail_own_run_200(self):
+        run = self._finished_run()
+        self.client.force_authenticate(user=self.user)
+        response = self.client.get(agent_detail_url(run.pk))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        self.assertEqual(data["id"], run.pk)
+        self.assertEqual(data["checks"]["passed"], 0)
+
+    def test_detail_foreign_run_404(self):
+        run = self._finished_run()
+        self.client.force_authenticate(user=self.other)
+        response = self.client.get(agent_detail_url(run.pk))
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_detail_invalid_id_404(self):
+        self.client.force_authenticate(user=self.user)
+        response = self.client.get(agent_detail_url(999999))
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_changes_endpoint_lists_diffs(self):
+        run = self._finished_run()
+        CodeChange.objects.create(
+            agent_run=run, file_path="app.py",
+            proposed_diff=make_diff("app.py", BUGGY_SOURCE, FIXED_SOURCE),
+        )
+        self.client.force_authenticate(user=self.user)
+        response = self.client.get(agent_changes_url(run.pk))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["file_path"], "app.py")
+        self.assertIn("+    return a + b", data[0]["proposed_diff"])
+
+    def test_changes_endpoint_foreign_run_404(self):
+        run = self._finished_run()
+        self.client.force_authenticate(user=self.other)
+        response = self.client.get(agent_changes_url(run.pk))
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_tests_endpoint_lists_results_with_attempt(self):
+        run = self._finished_run()
+        TestResult.objects.create(
+            agent_run=run, test_name="syntax:app.py",
+            status=TestStatus.PASSED, attempt=1,
+        )
+        TestResult.objects.create(
+            agent_run=run, test_name="tests", status=TestStatus.SKIPPED,
+            attempt=1, output="Sandbox execution not available.",
+        )
+        self.client.force_authenticate(user=self.user)
+        response = self.client.get(agent_tests_url(run.pk))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        self.assertEqual(len(data), 2)
+        self.assertEqual({row["attempt"] for row in data}, {1})
+
+    def test_tests_endpoint_foreign_run_404(self):
+        run = self._finished_run()
+        self.client.force_authenticate(user=self.other)
+        response = self.client.get(agent_tests_url(run.pk))
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
