@@ -22,4 +22,5 @@ urlpatterns = [
     path('api/auth/', include('accounts.urls')),
     path('api/repositories/', include('repositories.urls')),
     path('api/analysis/', include('analysis.urls')),
+    path('api/agent-runs/', include('analysis.agent_urls')),
 ]

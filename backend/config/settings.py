@@ -88,6 +88,28 @@ NEBIUS_BASE_URL = os.environ.get('NEBIUS_BASE_URL', 'https://api.tokenfactory.ne
 NEBIUS_MODEL = os.environ.get('NEBIUS_MODEL', '')
 NEBIUS_TIMEOUT_SECONDS = int(os.environ.get('NEBIUS_TIMEOUT', '30'))
 
+# ---------------------------------------------------------------------------
+# Agent run -- patch generation, validation and sandbox limits.
+# Every value is environment-tunable with a safe default. None of these are
+# secrets; the API key itself stays only in NEBIUS_API_KEY.
+#
+# AGENT_TEST_EXECUTION is an explicit opt-in for running the repository's
+# own tests inside the Docker sandbox. Even when enabled it additionally
+# requires a running Docker daemon and the trusted image -- without both,
+# test execution stays disabled and results are recorded as skipped.
+# ---------------------------------------------------------------------------
+AGENT_MAX_SUMMARY_CHARS = int(os.environ.get('AGENT_MAX_SUMMARY_CHARS', '6000'))
+AGENT_MAX_RESULT_OUTPUT_CHARS = int(os.environ.get('AGENT_MAX_RESULT_OUTPUT_CHARS', '4000'))
+AGENT_MAX_REPAIR_ATTEMPTS = int(os.environ.get('AGENT_MAX_REPAIR_ATTEMPTS', '2'))
+AGENT_TEST_EXECUTION = os.environ.get('AGENT_TEST_EXECUTION', '0') == '1'
+SANDBOX_IMAGE = os.environ.get('SANDBOX_IMAGE', 'python:3.12-slim')
+SANDBOX_TIMEOUT_SECONDS = int(os.environ.get('SANDBOX_TIMEOUT_SECONDS', '120'))
+SANDBOX_MEMORY = os.environ.get('SANDBOX_MEMORY', '256m')
+SANDBOX_CPUS = os.environ.get('SANDBOX_CPUS', '1.0')
+SANDBOX_PIDS_LIMIT = int(os.environ.get('SANDBOX_PIDS_LIMIT', '64'))
+# Non-root user the sandboxed process runs as (uid form, "nobody" = 65534).
+SANDBOX_USER = os.environ.get('SANDBOX_USER', '65534')
+
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',

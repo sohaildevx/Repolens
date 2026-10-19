@@ -45,3 +45,5 @@ Thumbs.db
 .idea/
 .vscode/*
 !.vscode/extensions.json
+
+/docs/agent-workflow.md
