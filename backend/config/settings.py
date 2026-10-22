@@ -197,3 +197,43 @@ MAILERS = {
         'BACKEND': 'django.core.mail.backends.console.EmailBackend',
     },
 }
+
+# ---------------------------------------------------------------------------
+# Logging / observability (Phase 8).
+# Route application loggers to the console with an env-tunable level. Django's
+# `django.*` loggers keep their own defaults; we only configure OUR app loggers
+# (analysis.*, repositories.*, accounts.*) so operational events -- analysis
+# started/failed, AI request failed, patch validation failed, sandbox timeout,
+# cleanup failure -- are visible without a monitoring platform.
+#
+# SECURITY: log formatters here never include request bodies, source code, or
+# credentials. Callers log only exception TYPES and short safe messages.
+# ---------------------------------------------------------------------------
+LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
+
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'standard': {
+            'format': '{asctime} {levelname} {name} {message}',
+            'style': '{',
+        },
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'standard',
+        },
+    },
+    'root': {
+        'handlers': ['console'],
+        'level': LOG_LEVEL,
+    },
+    'loggers': {
+        # Our application loggers (explicit, so their level is predictable).
+        'analysis': {'handlers': ['console'], 'level': LOG_LEVEL, 'propagate': False},
+        'repositories': {'handlers': ['console'], 'level': LOG_LEVEL, 'propagate': False},
+        'accounts': {'handlers': ['console'], 'level': LOG_LEVEL, 'propagate': False},
+    },
+}

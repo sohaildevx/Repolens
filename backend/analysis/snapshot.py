@@ -19,6 +19,7 @@ committed or pushed back -- ever.
 
 import base64
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -42,6 +43,16 @@ SNAPSHOT_MAX_FILE_BYTES = 100_000      # 100 KB per file
 SNAPSHOT_MAX_TOTAL_BYTES = 1_000_000   # 1 MB total content
 SNAPSHOT_DEADLINE_SECONDS = 90.0       # wall-clock budget for the whole fetch
 
+# Blob cache bounds. Git blobs are content-addressed by their SHA, so a given
+# SHA always decodes to the same bytes -- this makes the cache safe to reuse
+# across runs: no staleness (content can never change for a fixed SHA) and no
+# authorization bypass (we only ever cache blobs we already fetched through the
+# authenticated path for a repository the caller owns). It exists to stop the
+# N+1 blob re-download that otherwise re-fetches every file on each agent run
+# for the same commit, which is what exhausts the unauthenticated GitHub quota.
+BLOB_CACHE_MAX_ENTRIES = 512
+BLOB_CACHE_MAX_BYTES = 20_000_000      # 20 MB of decoded content, hard cap
+
 
 class SnapshotError(Exception):
     """Snapshot failure with a safe, user-facing message.
@@ -49,6 +60,68 @@ class SnapshotError(Exception):
     Messages are short and never contain host paths, credentials or raw
     exception details.
     """
+
+
+class _BlobCache:
+    """Small bounded cache: blob SHA -> decoded text content.
+
+    Bounded by BOTH entry count and total decoded bytes; the oldest entries
+    are evicted first (FIFO) once a bound is exceeded. In-memory only and
+    per-process: no shared state, no persistence, no cross-user surface. A
+    lock guards concurrent requests in a threaded server.
+    """
+
+    def __init__(self, max_entries=BLOB_CACHE_MAX_ENTRIES,
+                 max_bytes=BLOB_CACHE_MAX_BYTES):
+        self._max_entries = max_entries
+        self._max_bytes = max_bytes
+        self._data = {}          # sha -> (content, size)
+        self._order = []         # insertion order of SHAs, for FIFO eviction
+        self._total_bytes = 0
+        self._lock = threading.Lock()
+
+    def get(self, sha):
+        with self._lock:
+            entry = self._data.get(sha)
+            return entry[0] if entry else None
+
+    def put(self, sha, content):
+        size = len(content.encode("utf-8", errors="replace"))
+        if size > self._max_bytes:
+            return  # a single oversized blob is never cached
+        with self._lock:
+            if sha in self._data:
+                return
+            self._data[sha] = (content, size)
+            self._order.append(sha)
+            self._total_bytes += size
+            # Evict oldest until both bounds are respected.
+            while self._data and (
+                len(self._data) > self._max_entries
+                or self._total_bytes > self._max_bytes
+            ):
+                old_sha = self._order.pop(0)
+                _, old_size = self._data.pop(old_sha)
+                self._total_bytes -= old_size
+
+    def clear(self):
+        with self._lock:
+            self._data.clear()
+            self._order.clear()
+            self._total_bytes = 0
+
+    def __len__(self):
+        with self._lock:
+            return len(self._data)
+
+
+# Module-level cache shared by every snapshot fetch in this process.
+_BLOB_CACHE = _BlobCache()
+
+
+def clear_snapshot_cache():
+    """Drop all cached blobs (used by tests and any explicit invalidation)."""
+    _BLOB_CACHE.clear()
 
 
 @dataclass
@@ -218,9 +291,17 @@ def fetch_github_snapshot(repository) -> Snapshot:
             "some files were not considered)"
         )
 
-    # 4) Download the bounded blob set.
+    # 4) Download the bounded blob set. A blob SHA is content-addressed and
+    #    immutable, so a cache hit is always byte-identical to a fresh fetch.
+    #    Consulted first to avoid re-downloading unchanged files across runs
+    #    for the same commit (the N+1 that exhausts the GitHub quota).
     files = {}
     for path, blob_sha in candidates:
+        cached = _BLOB_CACHE.get(blob_sha)
+        if cached is not None:
+            files[path] = cached
+            continue
+
         blob = _get_json(
             session,
             f"{GITHUB_API_BASE}/repos/{owner}/{repo}/git/blobs/{blob_sha}",
@@ -236,6 +317,7 @@ def fetch_github_snapshot(repository) -> Snapshot:
         except (ValueError, TypeError):
             skipped.append(f"{path} (undecodable content)")
             continue
+        _BLOB_CACHE.put(blob_sha, content)
         files[path] = content
 
     if not files:

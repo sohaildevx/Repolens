@@ -104,6 +104,11 @@ def run_analysis(repository, files: list[dict], user=None) -> AnalysisRun:
         status=RunStatus.RUNNING,
         start_time=timezone.now(),
     )
+    # Operational event: analysis started (counts only, no file contents).
+    logger.info(
+        "analysis run %s started for repository %s (%s file(s))",
+        run.pk, repository.pk, len(files),
+    )
 
     try:
         payload = call_analyzer(files)
@@ -114,6 +119,10 @@ def run_analysis(repository, files: list[dict], user=None) -> AnalysisRun:
         meta = payload.get("meta") or {}
         analyzed = meta.get("files_analyzed", len(files))
         run.summary = _build_summary(analyzed, findings)
+        logger.info(
+            "analysis run %s completed: %s file(s), %s finding(s)",
+            run.pk, analyzed, len(findings),
+        )
     except AnalyzerTimeout as exc:
         run.status = RunStatus.FAILED
         run.summary = str(exc)

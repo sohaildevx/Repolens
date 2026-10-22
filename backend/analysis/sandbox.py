@@ -26,13 +26,17 @@ depends on the Docker daemon. This sandbox reduces -- it does not
 eliminate -- risk.
 """
 
+import logging
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
 from django.conf import settings
+
+logger = logging.getLogger(__name__)
 
 # Fixed command allowlist: only these exact argument shapes may ever run.
 # Anything else (git, pip, curl, shell flags...) is structurally impossible.
@@ -117,14 +121,20 @@ def build_run_command(exe, name, workspace, image, user) -> list:
     ]
 
 
-def _force_remove(exe: str, name: str) -> None:
-    """Best-effort guaranteed cleanup (stops and removes the container)."""
+def _force_remove(exe: str, name: str) -> bool:
+    """Best-effort guaranteed cleanup (stops and removes the container).
+
+    Returns True when the removal command reported success, False otherwise.
+    Callers log a warning on False so a leaked container is visible; the
+    result never masks the original outcome.
+    """
     try:
-        subprocess.run(
+        proc = subprocess.run(
             [exe, "rm", "-f", name], capture_output=True, timeout=15
         )
+        return proc.returncode == 0
     except (OSError, subprocess.TimeoutExpired):
-        pass
+        return False
 
 
 def run_tests(workspace) -> SandboxResult | None:
@@ -150,8 +160,17 @@ def run_tests(workspace) -> SandboxResult | None:
             exe, name, workspace, image, settings.SANDBOX_USER
         )
     except SandboxConfigurationError:
+        # Unsafe configuration (e.g. root user): refuse, record as skipped.
+        logger.warning("sandbox refused: unsafe configuration (%s)", settings.SANDBOX_USER)
         return None
 
+    # Operational event: sandbox execution starting. Logs the container name
+    # and image only -- never workspace contents or environment values.
+    logger.info(
+        "sandbox execution starting: container=%s image=%s timeout=%ss",
+        name, image, settings.SANDBOX_TIMEOUT_SECONDS,
+    )
+    started = time.monotonic()
     try:
         proc = subprocess.run(
             command,
@@ -160,17 +179,32 @@ def run_tests(workspace) -> SandboxResult | None:
             timeout=settings.SANDBOX_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
+        logger.warning(
+            "sandbox execution TIMED OUT after %.1fs: container=%s",
+            time.monotonic() - started, name,
+        )
         return SandboxResult(
             returncode=None,
             output="Sandbox execution timed out.",
             timed_out=True,
         )
-    except OSError:
+    except OSError as exc:
+        logger.error(
+            "sandbox failed to start: %s", type(exc).__name__
+        )
         return SandboxResult(returncode=None, output="Sandbox failed to start.")
     finally:
         # --rm covers clean exits; this guarantees removal after timeouts,
         # crashes and failed starts.
-        _force_remove(exe, name)
+        removed = _force_remove(exe, name)
+        if not removed:
+            logger.warning(
+                "sandbox container %s could not be confirmed removed", name
+            )
 
     output = ((proc.stdout or "") + (proc.stderr or ""))[:OUTPUT_RAW_LIMIT]
+    logger.info(
+        "sandbox execution finished in %.1fs: returncode=%s",
+        time.monotonic() - started, proc.returncode,
+    )
     return SandboxResult(returncode=proc.returncode, output=output)

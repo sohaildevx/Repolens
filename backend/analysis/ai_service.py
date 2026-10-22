@@ -39,6 +39,11 @@ from openai import (
 
 logger = logging.getLogger(__name__)
 
+# Hard bound on a single completion. Expected replies are small JSON objects
+# (one minimal patch, or one explanation), so 4096 tokens is generous while
+# still capping worst-case latency and transfer for a runaway generation.
+MAX_COMPLETION_TOKENS = 4096
+
 
 class AIError(Exception):
     """Base AI failure. str(exc) is always safe to show a client."""
@@ -92,10 +97,17 @@ def get_client() -> OpenAI:
 
 
 def chat_json(system_prompt: str, user_prompt: str,
-              *, temperature: float = 0.2) -> dict:
+              *, temperature: float = 0.2,
+              max_tokens: int = MAX_COMPLETION_TOKENS) -> dict:
     """One JSON-mode chat completion against the configured Nemotron model.
 
     Returns the parsed JSON object from the model's reply.
+
+    `max_tokens` bounds the completion size: expected replies are small JSON
+    objects (one patch or one explanation), so a runaway generation is cut
+    off instead of billing and transferring an unbounded response. A reply
+    truncated mid-JSON fails JSON parsing and surfaces as AIUnavailable --
+    never as a silently half-applied patch.
 
     Raises:
         AIConfigurationError -- required variables missing (names only)
@@ -115,6 +127,7 @@ def chat_json(system_prompt: str, user_prompt: str,
                 {"role": "user", "content": user_prompt},
             ],
             temperature=temperature,
+            max_tokens=max_tokens,
             response_format={"type": "json_object"},
         )
     except APITimeoutError:

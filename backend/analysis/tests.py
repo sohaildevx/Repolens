@@ -307,6 +307,44 @@ class AnalyzerServiceTests(TestCase):
         self.assertEqual(issue.line_number, 1)
 
     @patch("analysis.services.requests.post")
+    def test_zero_findings_is_completed_not_failed(self, mock_post):
+        """A clean analysis with ZERO findings is a SUCCESS, not a failure.
+
+        Definition-of-done: 'completed with 0 issues' must remain distinct
+        from 'analysis failed'. Both the status and the timestamps say
+        success; only the issue list is empty.
+        """
+        mock_post.return_value = _mock_http_ok(_analyzer_response(findings=[]))
+
+        run = run_analysis(self.repo, SAMPLE_FILES, user=self.user)
+
+        self.assertEqual(run.status, RunStatus.COMPLETED)
+        self.assertEqual(run.issues.count(), 0)
+        self.assertIsNotNone(run.completion_time)
+        self.assertNotIn("error", run.summary.lower())
+
+    @patch("analysis.services.requests.post")
+    def test_zero_findings_and_analysis_failure_are_distinct(self, mock_post):
+        """The direct contrast: clean run vs failed run are distinguishable."""
+        # 1) Clean run: completed + empty issue list.
+        mock_post.return_value = _mock_http_ok(_analyzer_response(findings=[]))
+        clean = run_analysis(self.repo, SAMPLE_FILES, user=self.user)
+
+        # 2) Failed run: 500 from the analyzer.
+        mock_post.return_value = MagicMock(status_code=500)
+        broken = run_analysis(self.repo, SAMPLE_FILES, user=self.user)
+
+        self.assertEqual(clean.status, RunStatus.COMPLETED)
+        self.assertEqual(clean.issues.count(), 0)
+        self.assertEqual(broken.status, RunStatus.FAILED)
+        self.assertTrue(broken.summary)          # a reason, never blank
+        # The failure must never masquerade as a clean empty result:
+        self.assertNotEqual(
+            (clean.status, clean.issues.count()),
+            (broken.status, broken.issues.count()),
+        )
+
+    @patch("analysis.services.requests.post")
     def test_timeout_marks_run_failed(self, mock_post):
         """A timeout must not leave the run stuck in 'running'."""
         mock_post.side_effect = http_requests.Timeout("too slow")
@@ -544,6 +582,81 @@ class AnalysisRunAPITests(APITestCase):
         self.assertEqual(response.data["status"], "completed")
         self.assertEqual(len(response.data["issues"]), 1)
         self.assertIn("summary", response.data)
+        # Bounded-issues metadata (Phase 8): always present, accurate here.
+        self.assertEqual(response.data["issue_count"], 1)
+        self.assertFalse(response.data["issues_truncated"])
+
+    @patch("analysis.services.requests.post")
+    def test_detail_caps_embedded_issues_and_reports_truncation(self, mock_post):
+        """Past DETAIL_ISSUE_LIMIT the embedded list is cut, count stays true."""
+        from .serializers import DETAIL_ISSUE_LIMIT
+
+        findings = [
+            {
+                "file_path": f"f{i}.py",
+                "line_number": 1,
+                "rule": "F401",
+                "severity": "low",
+                "description": "unused import",
+            }
+            for i in range(DETAIL_ISSUE_LIMIT + 25)
+        ]
+        mock_post.return_value = _mock_http_ok(_analyzer_response(findings=findings))
+        created = self.client.post(RUNS_URL, self._payload(), format="json")
+
+        response = self.client.get(run_detail_url(created.data["id"]))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["issues"]), DETAIL_ISSUE_LIMIT)
+        self.assertEqual(
+            response.data["issue_count"], DETAIL_ISSUE_LIMIT + 25
+        )
+        self.assertTrue(response.data["issues_truncated"])
+
+    @patch("analysis.services.requests.post")
+    def test_paginated_issues_endpoint_returns_all(self, mock_post):
+        """GET .../issues/ pages through the full list beyond the embed cap."""
+        from .serializers import DETAIL_ISSUE_LIMIT
+
+        findings = [
+            {
+                "file_path": f"f{i:04d}.py",
+                "line_number": 1,
+                "rule": "F401",
+                "severity": "low",
+                "description": "unused import",
+            }
+            for i in range(DETAIL_ISSUE_LIMIT + 10)
+        ]
+        mock_post.return_value = _mock_http_ok(_analyzer_response(findings=findings))
+        created = self.client.post(RUNS_URL, self._payload(), format="json")
+        run_id = created.data["id"]
+
+        page1 = self.client.get(f"/api/analysis/runs/{run_id}/issues/")
+        self.assertEqual(page1.status_code, status.HTTP_200_OK)
+        self.assertIn("results", page1.data)
+        self.assertEqual(page1.data["count"], DETAIL_ISSUE_LIMIT + 10)
+        self.assertEqual(len(page1.data["results"]), 20)   # default page size
+
+        # Walk every page and confirm we see exactly `count` unique issues.
+        seen, url = set(), f"/api/analysis/runs/{run_id}/issues/"
+        while url:
+            page = self.client.get(url)
+            for row in page.data["results"]:
+                seen.add(row["id"])
+            url = page.data.get("next")
+        self.assertEqual(len(seen), DETAIL_ISSUE_LIMIT + 10)
+
+    @patch("analysis.services.requests.post")
+    def test_paginated_issues_endpoint_foreign_run_404(self, mock_post):
+        mock_post.return_value = _mock_http_ok()
+        created = self.client.post(RUNS_URL, self._payload(), format="json")
+
+        self.client.force_authenticate(user=self.bob)
+        response = self.client.get(
+            f"/api/analysis/runs/{created.data['id']}/issues/"
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
     @patch("analysis.services.requests.post")
     def test_cannot_access_other_users_run(self, mock_post):
@@ -844,6 +957,32 @@ class AIServiceCallTests(SimpleTestCase):
                          {"type": "json_object"})
 
     @patch("analysis.ai_service.OpenAI")
+    def test_completion_is_bounded_by_max_tokens(self, mock_openai):
+        """A single completion is capped -- no unbounded model output.
+
+        The default bound applies automatically; an explicit smaller value is
+        honored (the agent layer can tighten it further when needed).
+        """
+        from .ai_service import MAX_COMPLETION_TOKENS
+
+        client = mock_openai.return_value
+        client.chat.completions.create.return_value = self._response(
+            json.dumps({"ok": True})
+        )
+
+        chat_json("Return JSON.", "hello")
+        create_kwargs = client.chat.completions.create.call_args.kwargs
+        self.assertEqual(create_kwargs["max_tokens"], MAX_COMPLETION_TOKENS)
+
+        chat_json("Return JSON.", "hello", max_tokens=256)
+        create_kwargs = client.chat.completions.create.call_args.kwargs
+        self.assertEqual(create_kwargs["max_tokens"], 256)
+        # The bound is a real integer, not None/0 (which would mean
+        # "provider default" or "no output at all").
+        self.assertIsInstance(MAX_COMPLETION_TOKENS, int)
+        self.assertGreater(MAX_COMPLETION_TOKENS, 0)
+
+    @patch("analysis.ai_service.OpenAI")
     def test_non_json_reply_is_safe_error(self, mock_openai):
         mock_openai.return_value.chat.completions.create.return_value = \
             self._response("definitely not json")
@@ -970,7 +1109,15 @@ from . import sandbox as _sandbox_module
 from .agent_service import run_agent
 from .patching import PatchError, apply_patch, make_diff, parse_patch
 from .sandbox import SandboxConfigurationError, SandboxResult, build_run_command
-from .snapshot import Snapshot, SnapshotError, fetch_github_snapshot, is_sensitive_path
+from .snapshot import (
+    BLOB_CACHE_MAX_BYTES,
+    Snapshot,
+    SnapshotError,
+    _BlobCache,
+    clear_snapshot_cache,
+    fetch_github_snapshot,
+    is_sensitive_path,
+)
 
 BUGGY_SOURCE = "def add(a, b):\n    return a - b\n"
 FIXED_SOURCE = "def add(a, b):\n    return a + b\n"
@@ -1276,6 +1423,15 @@ def _fake_github(responses):
 class SnapshotUnitTests(SimpleTestCase):
     """Snapshot fetching: exclusions, limits, GitHub error taxonomy."""
 
+    def setUp(self):
+        # The blob cache is module-level and persists across tests; clear it
+        # so each test sees a cold cache and its ordered fake-response list
+        # stays in sync with the number of HTTP calls actually made.
+        clear_snapshot_cache()
+
+    def tearDown(self):
+        clear_snapshot_cache()
+
     def test_sensitive_path_detection(self):
         for p in (".env", "src/.env.local", "id_rsa", "keys/server.pem",
                   "cfg/credentials"):
@@ -1301,6 +1457,61 @@ class SnapshotUnitTests(SimpleTestCase):
         self.assertEqual(snap.commit_sha, "c" * 40)
         self.assertEqual(snap.files["app.py"], BUGGY_SOURCE)
         self.assertEqual(snap.skipped, [])
+
+    def test_blob_cache_avoids_repeat_downloads_on_second_fetch(self):
+        """A second fetch of the same blobs issues NO new blob HTTP requests.
+
+        This is the N+1 fix: blobs are content-addressed by SHA, so a cached
+        blob is byte-identical to a fresh download. Only the metadata calls
+        (repo meta, commit, tree) repeat; blob downloads are served from cache.
+        """
+        blob = _base64.b64encode(BUGGY_SOURCE.encode()).decode()
+        tree = dict(data={"truncated": False, "tree": [
+            {"type": "blob", "path": "app.py", "sha": "b1", "size": 40},
+        ]})
+
+        # First fetch: full sequence -- meta, commit, tree, blob.
+        first = [
+            dict(data={"default_branch": "main"}),
+            dict(data={"sha": "c" * 40}),
+            tree,
+            dict(data={"encoding": "base64", "content": blob}),
+        ]
+        with patch("analysis.snapshot.requests.Session",
+                   return_value=_fake_github(first)):
+            snap1 = fetch_github_snapshot(
+                _NS(github_url="https://github.com/octo/hello")
+            )
+
+        # Second fetch: blob is cached, so NO blob response is provided. If the
+        # code tried to download it again, the side_effect list would be
+        # exhausted and raise StopIteration -- proving the cache was consulted.
+        second = [
+            dict(data={"default_branch": "main"}),
+            dict(data={"sha": "c" * 40}),
+            tree,
+        ]
+        fake_session = _fake_github(second)
+        with patch("analysis.snapshot.requests.Session",
+                   return_value=fake_session):
+            snap2 = fetch_github_snapshot(
+                _NS(github_url="https://github.com/octo/hello")
+            )
+            # Exactly 3 HTTP calls (meta, commit, tree) -- the blob was cached.
+            self.assertEqual(fake_session.get.call_count, 3)
+
+        self.assertEqual(snap1.files["app.py"], BUGGY_SOURCE)
+        self.assertEqual(snap2.files["app.py"], BUGGY_SOURCE)
+
+    def test_blob_cache_evicts_when_entry_bound_exceeded(self):
+        """The cache never exceeds its configured entry bound (FIFO)."""
+        cache = _BlobCache(max_entries=2, max_bytes=BLOB_CACHE_MAX_BYTES)
+        cache.put("s1", "one")
+        cache.put("s2", "two")
+        cache.put("s3", "three")
+        self.assertEqual(len(cache), 2)
+        self.assertIsNone(cache.get("s1"))   # oldest evicted
+        self.assertEqual(cache.get("s3"), "three")
 
     def test_fetch_excludes_sensitive_oversized_and_non_python(self):
         blob = _base64.b64encode(BUGGY_SOURCE.encode()).decode()
@@ -1698,3 +1909,341 @@ class AgentRunAPITests(AgentFixtureMixin, APITestCase):
         self.client.force_authenticate(user=self.other)
         response = self.client.get(agent_tests_url(run.pk))
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 -- Agent evaluation suite (deterministic, mocked, zero credits)
+# ---------------------------------------------------------------------------
+
+from .evaluation import EVAL_CASES, evaluate_case  # noqa: E402
+
+
+class Phase8ReliabilityTests(AgentFixtureMixin, TestCase):
+    """Direct regression tests for the Phase 8 reliability fixes."""
+
+    def _run_with(self, snapshot=None, chat=None, analyzer=None,
+                  sandbox=_SENTINEL):
+        snap = snapshot or make_snapshot()
+        chat_kw = (
+            {"side_effect": chat} if isinstance(chat, list)
+            else {"return_value": chat or GOOD_PATCH}
+        )
+        analyzer_kw = (
+            {"side_effect": analyzer} if isinstance(analyzer, list)
+            else {"return_value": analyzer or CLEAN_ANALYZER}
+        )
+        if sandbox is _SENTINEL:
+            sandbox_kw = {"return_value": SandboxResult(0, "OK")}
+        elif isinstance(sandbox, list):
+            sandbox_kw = {"side_effect": sandbox}
+        else:
+            sandbox_kw = {"return_value": sandbox}
+        with patch(
+            "analysis.agent_service.fetch_github_snapshot", return_value=snap
+        ), patch(
+            "analysis.agent_service.chat_json", **chat_kw
+        ), patch(
+            "analysis.agent_service.call_analyzer", **analyzer_kw
+        ), patch(
+            "analysis.sandbox.run_tests", **sandbox_kw
+        ):
+            return run_agent(self.issue)
+
+    # -- Bug 1: duplicate CodeChange rows across retry attempts -------------
+
+    def test_two_attempt_run_leaves_exactly_one_code_change(self):
+        """A retry must replace the prior diff, not append a second one.
+
+        Both attempts edit app.py; only the final diff should survive.
+        """
+        first = SandboxResult(1, "FAILED attempt 1")
+        second = SandboxResult(0, "OK")
+        run = self._run_with(sandbox=[first, second])
+        self.assertEqual(run.status, RunStatus.COMPLETED)
+        self.assertEqual(run.repair_attempts, 2)
+        changes = list(run.code_changes.all())
+        self.assertEqual(
+            len(changes), 1,
+            f"expected 1 CodeChange after a 2-attempt run, got {len(changes)}",
+        )
+        self.assertEqual(changes[0].file_path, "app.py")
+
+    # -- Bug 2: analyzer tool crash must NOT become a false pass ------------
+
+    def test_analyzer_tool_error_is_error_not_pass(self):
+        """A TOOL_ERROR finding (linter crashed) records ERROR, not PASSED."""
+        tool_crash = {
+            "summary": "tool failed", "files_analyzed": 1,
+            "issues": [{"file_path": ".", "line_number": 1,
+                        "severity": "medium", "source": "ruff",
+                        "rule": "TOOL_ERROR",
+                        "description": "Ruff could not be executed."}],
+        }
+        run = self._run_with(analyzer=[tool_crash, tool_crash])
+        self.assertEqual(run.status, RunStatus.FAILED)
+        results = {r.test_name: r.status for r in run.test_results.all()}
+        self.assertEqual(results["static-analysis"], TestStatus.ERROR)
+        # A dead linter is not retryable -- no wasted repair attempt.
+        self.assertEqual(run.repair_attempts, 1)
+
+    def test_tool_timeout_findings_also_error(self):
+        """TOOL_TIMEOUT findings are likewise never counted as a pass."""
+        tool_timeout = {
+            "summary": "timeout", "files_analyzed": 1,
+            "issues": [{"file_path": ".", "line_number": 1,
+                        "severity": "medium", "source": "bandit",
+                        "rule": "TOOL_TIMEOUT",
+                        "description": "Bandit timed out."}],
+        }
+        run = self._run_with(analyzer=[tool_timeout, tool_timeout])
+        self.assertEqual(run.status, RunStatus.FAILED)
+        results = {r.test_name: r.status for r in run.test_results.all()}
+        self.assertEqual(results["static-analysis"], TestStatus.ERROR)
+
+    # -- Bug 3: AGENT_MAX_REPAIR_ATTEMPTS is honored ------------------------
+
+    def test_max_repair_attempts_setting_is_read(self):
+        """The configured attempt count (not a hardcode) bounds the loop."""
+        from .agent_service import _max_attempts
+
+        with override_settings(AGENT_MAX_REPAIR_ATTEMPTS=1):
+            self.assertEqual(_max_attempts(), 1)
+        with override_settings(AGENT_MAX_REPAIR_ATTEMPTS=3):
+            self.assertEqual(_max_attempts(), 3)
+
+    def test_max_repair_attempts_is_clamped(self):
+        """Out-of-range config values are clamped, never trusted blindly."""
+        from .agent_service import _max_attempts
+
+        with override_settings(AGENT_MAX_REPAIR_ATTEMPTS=0):
+            self.assertEqual(_max_attempts(), 1)   # floor
+        with override_settings(AGENT_MAX_REPAIR_ATTEMPTS=99):
+            self.assertEqual(_max_attempts(), 5)   # ceiling
+
+    def test_single_attempt_setting_stops_after_one(self):
+        """With attempts=1, a failing run makes exactly one attempt."""
+        with override_settings(AGENT_MAX_REPAIR_ATTEMPTS=1):
+            run = self._run_with(sandbox=SandboxResult(1, "FAILED"))
+        self.assertEqual(run.status, RunStatus.FAILED)
+        self.assertEqual(run.repair_attempts, 1)
+
+    # -- Bug 4: no overclaiming "validated" when tests are skipped ----------
+
+    def test_skipped_tests_do_not_claim_validated(self):
+        """A completed run with skipped tests says UNVERIFIED, not validated."""
+        run = self._run_with(sandbox=None)
+        self.assertEqual(run.status, RunStatus.COMPLETED)
+        self.assertNotIn("validated by tests", run.final_summary)
+        self.assertIn("UNVERIFIED", run.final_summary)
+
+    def test_tests_run_summary_claims_validated_by_tests(self):
+        """When tests genuinely ran and passed, 'validated by tests' is OK."""
+        run = self._run_with(sandbox=SandboxResult(0, "OK"))
+        self.assertEqual(run.status, RunStatus.COMPLETED)
+        self.assertIn("validated by tests", run.final_summary)
+
+    # -- Bug 5: static-check helper returns a uniform 3-tuple ---------------
+
+    def test_static_check_returns_three_tuple_when_no_changes(self):
+        """The no-changed-files path returns 3 values like every other path."""
+        from .agent_service import _run_static_checks
+
+        with patch("analysis.agent_service._record"):
+            result = _run_static_checks(self.issue, make_snapshot(), [], 1)
+        self.assertEqual(len(result), 3)
+        passed, summary, retryable = result
+        self.assertTrue(passed)
+        self.assertEqual(summary, "")
+        self.assertTrue(retryable)
+
+
+class AgentDuplicateRequestTests(AgentFixtureMixin, APITestCase):
+    """A second submit while a run is in flight must not start a second run."""
+
+    def test_second_submit_while_running_returns_409(self):
+        AgentRun.objects.create(
+            analysis_run=self.analysis_run,
+            issue=self.issue,
+            status=RunStatus.RUNNING,
+        )
+        self.client.force_authenticate(user=self.user)
+        with patch("analysis.agent_service.run_agent") as mock_run:
+            response = self.client.post(agent_run_url_for_issue(self.issue.pk))
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        mock_run.assert_not_called()   # no second Nebius-bound run started
+
+    def test_submit_after_previous_run_finished_is_allowed(self):
+        AgentRun.objects.create(
+            analysis_run=self.analysis_run,
+            issue=self.issue,
+            status=RunStatus.COMPLETED,
+        )
+        self.client.force_authenticate(user=self.user)
+        finished = AgentRun.objects.create(
+            analysis_run=self.analysis_run, issue=self.issue,
+            status=RunStatus.COMPLETED,
+        )
+        with patch("analysis.agent_service.run_agent",
+                   return_value=finished) as mock_run:
+            response = self.client.post(agent_run_url_for_issue(self.issue.pk))
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        mock_run.assert_called_once()
+
+    def test_in_flight_run_of_another_issue_does_not_block(self):
+        """The guard is per-issue: a different issue is not blocked."""
+        other_issue = Issue.objects.create(
+            analysis_run=self.analysis_run,
+            file_path="other.py", line_number=1, severity=Severity.LOW,
+            description="x",
+        )
+        AgentRun.objects.create(
+            analysis_run=self.analysis_run,
+            issue=self.issue,           # a DIFFERENT issue is in flight
+            status=RunStatus.RUNNING,
+        )
+        self.client.force_authenticate(user=self.user)
+        finished = AgentRun.objects.create(
+            analysis_run=self.analysis_run, issue=other_issue,
+            status=RunStatus.COMPLETED,
+        )
+        with patch("analysis.agent_service.run_agent",
+                   return_value=finished) as mock_run:
+            response = self.client.post(agent_run_url_for_issue(other_issue.pk))
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        mock_run.assert_called_once()
+
+
+class AgentEvaluationTests(TestCase):
+    """Drive every fixture scenario through the real run_agent.
+
+    Each case records the outcomes the spec requires (initial test result,
+    patch generated/applied, checks executed, final test result, repair
+    attempts, final status) and -- where a real bug is fixable -- runs a
+    trusted behavioral regression check so a patch only counts as a FIX when
+    the expected behavior is actually validated, never merely because it
+    parsed or applied.
+    """
+
+    def _eval(self, name):
+        return evaluate_case(EVAL_CASES[name])
+
+    # -- scenarios that must genuinely FIX and VERIFY behavior -------------
+
+    def test_logic_bug_fixed_and_verified(self):
+        out = self._eval("logic_bug")
+        self.assertEqual(out.final_status, RunStatus.COMPLETED)
+        self.assertEqual(out.repair_attempts, 1)
+        self.assertTrue(out.patch_applied)
+        self.assertTrue(out.behavior_verified, out.regression_output)
+        self.assertEqual(out.final_test_result, TestStatus.PASSED)
+
+    def test_division_by_zero_fixed_and_verified(self):
+        out = self._eval("division_by_zero")
+        self.assertEqual(out.final_status, RunStatus.COMPLETED)
+        self.assertTrue(out.patch_applied)
+        self.assertTrue(out.behavior_verified, out.regression_output)
+
+    def test_syntax_error_repaired(self):
+        out = self._eval("syntax_error")
+        self.assertEqual(out.final_status, RunStatus.COMPLETED)
+        self.assertTrue(out.patch_applied)
+        self.assertTrue(out.behavior_verified, out.regression_output)
+
+    def test_successful_patch_passes_regression(self):
+        out = self._eval("successful_patch")
+        self.assertEqual(out.final_status, RunStatus.COMPLETED)
+        self.assertTrue(out.patch_applied)
+        # The palindrome fix must handle spaces, punctuation and case.
+        self.assertTrue(out.behavior_verified, out.regression_output)
+        self.assertIn("syntax", out.checks_executed)
+        self.assertIn("static-analysis", out.checks_executed)
+
+    # -- scenarios that must FAIL honestly ----------------------------------
+
+    def test_invalid_ai_patch_fails_after_retry(self):
+        out = self._eval("invalid_ai_patch")
+        self.assertEqual(out.final_status, RunStatus.FAILED)
+        self.assertEqual(out.repair_attempts, 2)
+        self.assertFalse(out.patch_applied)
+        self.assertFalse(out.behavior_verified)
+
+    def test_patch_that_does_not_apply_fails(self):
+        out = self._eval("patch_does_not_apply")
+        self.assertEqual(out.final_status, RunStatus.FAILED)
+        self.assertFalse(out.patch_applied)
+
+    def test_repair_still_fails_reports_failed(self):
+        out = self._eval("repair_still_fails")
+        self.assertEqual(out.final_status, RunStatus.FAILED)
+        self.assertEqual(out.repair_attempts, 2)
+        self.assertEqual(out.final_test_result, TestStatus.FAILED)
+
+    def test_sandbox_timeout_is_error_not_pass(self):
+        out = self._eval("sandbox_timeout")
+        self.assertEqual(out.final_status, RunStatus.FAILED)
+        self.assertEqual(out.final_test_result, TestStatus.ERROR)
+
+    # -- Docker unavailable: skipped, never passed --------------------------
+
+    def test_docker_unavailable_records_skipped_not_passed(self):
+        out = self._eval("docker_unavailable")
+        # Static checks pass, so the run completes; tests are SKIPPED.
+        self.assertEqual(out.final_status, RunStatus.COMPLETED)
+        self.assertEqual(out.final_test_result, TestStatus.SKIPPED)
+        # Behavioral verification still happens via the trusted check.
+        self.assertTrue(out.behavior_verified, out.regression_output)
+        # And the summary must NOT claim tests validated the fix.
+        self.assertNotIn("validated by tests", out.final_summary)
+        self.assertIn("UNVERIFIED", out.final_summary)
+
+    # -- failing-then-passing suite ----------------------------------------
+
+    def test_failing_test_suite_then_passing_retry(self):
+        out = self._eval("failing_test_suite")
+        self.assertEqual(out.final_status, RunStatus.COMPLETED)
+        self.assertEqual(out.repair_attempts, 2)
+        self.assertEqual(out.final_test_result, TestStatus.PASSED)
+        self.assertTrue(out.behavior_verified, out.regression_output)
+
+    # -- structural guarantees ---------------------------------------------
+
+    def test_all_ten_required_scenarios_present(self):
+        """The suite covers every category the spec requires."""
+        required = {
+            "logic_bug", "division_by_zero", "syntax_error",
+            "invalid_ai_patch", "patch_does_not_apply", "failing_test_suite",
+            "repair_still_fails", "sandbox_timeout", "docker_unavailable",
+            "successful_patch",
+        }
+        self.assertEqual(required, set(EVAL_CASES))
+
+    def test_every_case_records_required_outcomes(self):
+        """Each scenario populates the outcome fields the spec asks for."""
+        for name in sorted(EVAL_CASES):
+            with self.subTest(case=name):
+                out = self._eval(name)
+                self.assertIn(
+                    out.final_status, (RunStatus.COMPLETED, RunStatus.FAILED)
+                )
+                self.assertGreaterEqual(out.repair_attempts, 1)
+                self.assertIsInstance(out.patch_generated, bool)
+                self.assertIsInstance(out.patch_applied, bool)
+                if out.patch_applied:
+                    # Checks only run once a patch is actually in the
+                    # workspace; an invalid/non-applying patch records none.
+                    self.assertTrue(out.checks_executed)
+                self.assertTrue(out.final_summary)
+
+    def test_no_case_claims_fix_without_behavioral_verification(self):
+        """A completed run with a real bug must be behavior-verified.
+
+        Lint/syntax success alone is never treated as proof the bug is fixed.
+        """
+        for name in ("logic_bug", "division_by_zero", "successful_patch"):
+            with self.subTest(case=name):
+                out = self._eval(name)
+                self.assertEqual(out.final_status, RunStatus.COMPLETED)
+                self.assertTrue(
+                    out.behavior_verified,
+                    f"{name}: completed without behavioral verification",
+                )

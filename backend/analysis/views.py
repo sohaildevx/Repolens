@@ -16,11 +16,16 @@ disagree on behavior.
 """
 
 from rest_framework import status
-from rest_framework.generics import CreateAPIView, RetrieveAPIView
+from rest_framework.generics import (
+    CreateAPIView,
+    ListAPIView,
+    RetrieveAPIView,
+)
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from repositories.models import Repository
+from repositories.views import RepositoryPagination
 
 from .models import AnalysisRun, AgentRun, CodeChange, Issue, RunStatus, TestResult
 from .serializers import (
@@ -29,6 +34,7 @@ from .serializers import (
     AnalysisRunSerializer,
     AnalyzeFilesSerializer,
     CodeChangeSerializer,
+    IssueSerializer,
     TestResultSerializer,
 )
 from .services import run_analysis
@@ -114,7 +120,7 @@ class AnalysisRunCreateView(CreateAPIView):
 
 
 class AnalysisRunDetailView(RetrieveAPIView):
-    """GET /api/analysis/runs/<id>/ -- one run with its issues."""
+    """GET /api/analysis/runs/<id>/ -- one run with its issues (bounded)."""
 
     permission_classes = [IsAuthenticated]
     serializer_class = AnalysisRunSerializer
@@ -125,6 +131,45 @@ class AnalysisRunDetailView(RetrieveAPIView):
             .filter(repository__owner=self.request.user)
             .select_related("repository")
         )
+
+
+class AnalysisRunIssuesView(ListAPIView):
+    """GET /api/analysis/runs/<id>/issues/ -- the run's issues, paginated.
+
+    The detail endpoint embeds at most DETAIL_ISSUE_LIMIT issues to keep its
+    payload bounded; this endpoint serves the FULL list through standard
+    page-number pagination so large result sets never arrive in one response.
+    Ownership is enforced by the queryset filter (404 for foreign runs).
+    """
+
+    permission_classes = [IsAuthenticated]
+    serializer_class = IssueSerializer
+    pagination_class = RepositoryPagination
+
+    def get_queryset(self):
+        return (
+            Issue.objects
+            .filter(
+                analysis_run_id=self.kwargs["pk"],
+                analysis_run__repository__owner=self.request.user,
+            )
+            .order_by("file_path", "line_number")
+        )
+
+    def list(self, request, *args, **kwargs):
+        # A list view with an ownership-filtered queryset would otherwise
+        # return 200 + [] for a foreign/nonexistent run -- indistinguishable
+        # from an existing run that genuinely has no issues. Check the run
+        # itself first so unauthorized access stays a 404, matching every
+        # other endpoint in this API (IDs never leak between accounts).
+        if not AnalysisRun.objects.filter(
+            pk=self.kwargs["pk"], repository__owner=request.user
+        ).exists():
+            return Response(
+                {"detail": "Analysis run not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return super().list(request, *args, **kwargs)
 
 
 def _owned_issue(user, issue_id):
@@ -161,6 +206,24 @@ class AgentRunCreateView(CreateAPIView):
                 {"detail": "Issue not found."},
                 status=status.HTTP_404_NOT_FOUND,
             )
+
+        # Duplicate-request guard: a run is executed synchronously, so an
+        # already in-flight run for this issue means a second submit is a
+        # duplicate (e.g. a double-click). Refuse it with 409 so we never
+        # spend a second Nebius call or race two runs on the same issue.
+        if AgentRun.objects.filter(
+            issue=issue,
+            status__in=[RunStatus.PENDING, RunStatus.RUNNING],
+        ).exists():
+            return Response(
+                {
+                    "detail": (
+                        "An agent run for this issue is already in progress."
+                    )
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
         # Imported here so a circular import at module load is impossible.
         from .agent_service import run_agent
 

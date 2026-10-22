@@ -18,6 +18,11 @@ urlpatterns = [
         name="run-detail",
     ),
     path(
+        "runs/<int:pk>/issues/",
+        views.AnalysisRunIssuesView.as_view(),
+        name="run-issues",
+    ),
+    path(
         "issues/<int:issue_id>/agent-run/",
         views.AgentRunCreateView.as_view(),
         name="agent-run-create",

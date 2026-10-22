@@ -23,6 +23,11 @@ MAX_FILES = 100
 MAX_FILE_BYTES = 200_000        # 200 KB per file
 MAX_TOTAL_BYTES = 2_000_000     # 2 MB per submission
 
+# Max issues embedded in a single run-detail response. Keeps the payload
+# bounded on large repositories; the true total is always in `issue_count`
+# and the full list is available via the paginated .../issues/ endpoint.
+DETAIL_ISSUE_LIMIT = 100
+
 # Filenames the analyzer refuses to touch; refuse them one layer earlier.
 SENSITIVE_PATTERNS = {
     ".env", ".env.local", ".env.production",
@@ -128,9 +133,19 @@ class IssueSerializer(serializers.ModelSerializer):
 
 
 class AnalysisRunSerializer(serializers.ModelSerializer):
-    """Read-only run detail, including nested issues for the detail view."""
+    """Read-only run detail, including nested issues for the detail view.
 
-    issues = IssueSerializer(many=True, read_only=True)
+    The embedded issue list is BOUNDED: a run over a large repository could
+    produce thousands of findings, and embedding all of them makes the detail
+    response unbounded. At most ANALYZER_DETAIL_ISSUE_LIMIT issues are
+    embedded; `issue_count` always reports the true total and
+    `issues_truncated` is True when the embedded list was cut. Clients that
+    need every issue use the paginated GET .../issues/ endpoint instead.
+    """
+
+    issues = serializers.SerializerMethodField()
+    issue_count = serializers.SerializerMethodField()
+    issues_truncated = serializers.SerializerMethodField()
     repository_name = serializers.CharField(
         source="repository.name", read_only=True
     )
@@ -147,8 +162,23 @@ class AnalysisRunSerializer(serializers.ModelSerializer):
             "summary",
             "created_at",
             "issues",
+            "issue_count",
+            "issues_truncated",
         )
         read_only_fields = fields
+
+    def _limited_issues(self, obj):
+        # Cheap, stable slice: count is one query, the slice is bounded.
+        return obj.issues.all()[:DETAIL_ISSUE_LIMIT]
+
+    def get_issues(self, obj):
+        return IssueSerializer(self._limited_issues(obj), many=True).data
+
+    def get_issue_count(self, obj):
+        return obj.issues.count()
+
+    def get_issues_truncated(self, obj):
+        return obj.issues.count() > DETAIL_ISSUE_LIMIT
 
 
 class AgentRunSerializer(serializers.ModelSerializer):
