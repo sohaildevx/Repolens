@@ -22,8 +22,10 @@ Design notes:
 """
 
 import ast
+import logging
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 from django.conf import settings
@@ -37,8 +39,14 @@ from .patching import PatchError, apply_patch, make_diff, parse_patch
 from .services import AnalyzerError, call_analyzer
 from .snapshot import SnapshotError, fetch_github_snapshot
 
-# Hard cap: one initial attempt + at most one repair retry.
-MAX_REPAIR_ATTEMPTS = 2
+logger = logging.getLogger(__name__)
+
+# Default number of attempts when AGENT_MAX_REPAIR_ATTEMPTS is unset.
+DEFAULT_MAX_REPAIR_ATTEMPTS = 2
+# Absolute bounds on the configured value: at least one attempt (no retry),
+# at most five (a misconfigured env var can never loop a request forever).
+MIN_MAX_REPAIR_ATTEMPTS = 1
+MAX_MAX_REPAIR_ATTEMPTS = 5
 
 # Bounded feedback returned to the model on a failed validation.
 FAILURE_FEEDBACK_CHARS = 2_000
@@ -111,15 +119,17 @@ def _check_syntax(path, content, agent_run, attempt):
 def _run_static_checks(agent_run, workspace, changed_paths, attempt):
     """Run ruff and bandit via the Flask analyzer on the changed files only.
 
-    Returns (passed, failed_summary). Tool failures are recorded as errors
-    and never counted as a pass.
+    Returns (passed, failed_summary, retryable). Tool failures are recorded
+    as errors and never counted as a pass. `retryable` is False for anything
+    a new model patch cannot fix (unreadable input, a dead analyzer).
     """
     changed = sorted(changed_paths)
     if not changed:
-        # Nothing changed -> nothing to lint; record honestly.
+        # Nothing changed -> nothing to lint; record honestly. A 3-tuple so
+        # the caller's unpacking is uniform across every return path.
         _record(agent_run, "static-analysis", TestStatus.SKIPPED,
                 "No changed Python files to check.", attempt)
-        return True, ""
+        return True, "", True
 
     payload = []
     for rel in changed:
@@ -139,6 +149,25 @@ def _run_static_checks(agent_run, workspace, changed_paths, attempt):
         return False, f"static analysis tool error: {exc}", False
 
     issues = result.get("issues", [])
+
+    # A tool-level failure (Ruff/Bandit crashed or timed out) is reported by
+    # the analyzer as a finding on path "." with rule TOOL_ERROR/TOOL_TIMEOUT.
+    # Those are NOT tied to a changed file, so the changed-file filter below
+    # would drop them and silently turn a dead linter into a pass. Surface
+    # them as an ERROR instead (not retryable: a new patch cannot revive the
+    # analyzer subprocess).
+    tool_failures = [
+        i for i in issues
+        if i.get("file_path") == "."
+        or str(i.get("rule", "")).startswith("TOOL_")
+    ]
+    if tool_failures:
+        messages = "; ".join(
+            str(i.get("description", "analysis tool failed")) for i in tool_failures[:5]
+        )
+        _record(agent_run, "static-analysis", TestStatus.ERROR, messages, attempt)
+        return False, "static analysis tool failed", False
+
     # Only surface issues that are on the files we changed.
     changed_set = set(changed)
     relevant = [i for i in issues if i.get("file_path") in changed_set]
@@ -308,7 +337,14 @@ def _restore_workspace(workspace, snapshot):
 
 
 def _persist_changes(agent_run, workspace, original_files):
-    """STEP G: store one CodeChange row per modified file, with a diff."""
+    """STEP G: store one CodeChange row per modified file, with a diff.
+
+    Clears any diffs recorded by a previous attempt first. Each attempt
+    starts from the pristine snapshot, so the workspace always reflects
+    only the LATEST patch; without this, a multi-attempt run would store
+    one diff per attempt -- including diffs from discarded attempts.
+    """
+    agent_run.code_changes.all().delete()
     for rel, before in original_files.items():
         py = workspace / rel
         if not py.is_file():
@@ -321,6 +357,22 @@ def _persist_changes(agent_run, workspace, original_files):
             file_path=rel,
             proposed_diff=make_diff(rel, before, after),
         )
+
+
+def _max_attempts() -> int:
+    """Configured attempt count, clamped to safe bounds.
+
+    Reads AGENT_MAX_REPAIR_ATTEMPTS from settings but never trusts it blindly:
+    a misconfigured value (0, negative, absurdly large) is clamped so a run
+    always makes at least one attempt and can never loop a request forever.
+    """
+    try:
+        configured = int(getattr(settings, "AGENT_MAX_REPAIR_ATTEMPTS",
+                                 DEFAULT_MAX_REPAIR_ATTEMPTS))
+    except (TypeError, ValueError):
+        configured = DEFAULT_MAX_REPAIR_ATTEMPTS
+    return max(MIN_MAX_REPAIR_ATTEMPTS,
+               min(configured, MAX_MAX_REPAIR_ATTEMPTS))
 
 
 def run_agent(issue):
@@ -336,7 +388,15 @@ def run_agent(issue):
     )
     agent_run.status = RunStatus.RUNNING
     agent_run.save(update_fields=["status", "updated_at"])
+    started = time.monotonic()
+    # Operational event: run started. Logs IDs, counts and durations only --
+    # never source code, prompts, or credentials.
+    logger.info(
+        "agent run %s started for issue %s (%s:%s)",
+        agent_run.pk, issue.pk, issue.file_path, issue.line_number,
+    )
 
+    max_attempts = _max_attempts()
     workspace = None
     snapshot = None
     original_files = {}
@@ -348,6 +408,9 @@ def run_agent(issue):
             agent_run.status = RunStatus.FAILED
             agent_run.final_summary = f"Snapshot failed: {snap_or_err}"
             agent_run.save()
+            logger.warning(
+                "agent run %s snapshot failed: %s", agent_run.pk, snap_or_err
+            )
             return agent_run
         snapshot = snap_or_err
         original_files = dict(snapshot.files)
@@ -360,13 +423,17 @@ def run_agent(issue):
                 "(only .py files were fetched)."
             )
             agent_run.save()
+            logger.warning(
+                "agent run %s: issue file %s not in snapshot",
+                agent_run.pk, path,
+            )
             return agent_run
 
         feedback = None
         last_failure = ""
         retryable = True
-        # STEP C-F loop: at most MAX_REPAIR_ATTEMPTS.
-        for attempt in range(1, MAX_REPAIR_ATTEMPTS + 1):
+        # STEP C-F loop: at most max_attempts.
+        for attempt in range(1, max_attempts + 1):
             agent_run.repair_attempts = attempt
             agent_run.save(update_fields=["repair_attempts", "updated_at"])
 
@@ -386,6 +453,10 @@ def run_agent(issue):
                     f"AI request failed: {_safe_summary(str(exc))}"
                 )
                 agent_run.save()
+                logger.warning(
+                    "agent run %s AI request failed on attempt %s: %s",
+                    agent_run.pk, attempt, exc,
+                )
                 return agent_run
 
             try:
@@ -394,7 +465,11 @@ def run_agent(issue):
                 # Malformed or unsafe model output: consume the retry.
                 feedback = _safe_summary(str(exc))
                 last_failure = f"invalid AI patch: {feedback}"
-                if attempt == MAX_REPAIR_ATTEMPTS:
+                logger.info(
+                    "agent run %s patch rejected on attempt %s: %s",
+                    agent_run.pk, attempt, exc,
+                )
+                if attempt == max_attempts:
                     break
                 continue
 
@@ -406,10 +481,20 @@ def run_agent(issue):
             except PatchError as exc:
                 feedback = _safe_summary(str(exc))
                 last_failure = f"patch application failed: {feedback}"
-                if attempt == MAX_REPAIR_ATTEMPTS:
+                logger.info(
+                    "agent run %s patch application failed on attempt %s: %s",
+                    agent_run.pk, attempt, exc,
+                )
+                if attempt == max_attempts:
                     break
                 continue
 
+            # Persist THIS attempt's diff, replacing any diff from a prior
+            # attempt. Each attempt starts from the pristine snapshot, so the
+            # workspace currently reflects only the latest patch -- but a
+            # previous attempt may already have written a CodeChange row.
+            # Without clearing, a 2-attempt run that edits the same file
+            # twice would store two diffs (including the discarded one).
             _persist_changes(agent_run, workspace, original_files)
 
             # STEP E
@@ -418,19 +503,44 @@ def run_agent(issue):
             )
             if passed:
                 agent_run.status = RunStatus.COMPLETED
-                agent_run.final_summary = (
-                    f"Fix validated on attempt {attempt}."
-                    + (" (after one repair retry)" if attempt == 2 else "")
-                    + (" Repository tests were NOT executed "
-                       "(sandbox unavailable)." if tests_skipped else "")
-                )
+                if tests_skipped:
+                    # Static/syntax checks passed but behavior was NOT
+                    # verified by tests. Do not overclaim "validated".
+                    agent_run.final_summary = (
+                        f"Patch applied and static checks passed on attempt "
+                        f"{attempt}"
+                        + (" (after one repair retry)" if attempt > 1 else "")
+                        + ". Repository tests were NOT executed (sandbox "
+                        "unavailable), so the fix is UNVERIFIED by tests."
+                    )
+                    logger.info(
+                        "agent run %s completed on attempt %s "
+                        "(tests SKIPPED, unverified)",
+                        agent_run.pk, attempt,
+                    )
+                else:
+                    agent_run.final_summary = (
+                        f"Fix validated by tests on attempt {attempt}"
+                        + (" (after one repair retry)" if attempt > 1 else "")
+                        + "."
+                    )
+                    logger.info(
+                        "agent run %s completed on attempt %s "
+                        "(tests PASSED, verified)",
+                        agent_run.pk, attempt,
+                    )
                 agent_run.save()
                 return agent_run
 
             # STEP F: one repair retry, then stop.
             feedback = failure
             last_failure = failure
-            if attempt == MAX_REPAIR_ATTEMPTS or not retryable:
+            logger.info(
+                "agent run %s attempt %s failed validation: %s "
+                "(retryable=%s)",
+                agent_run.pk, attempt, failure, retryable,
+            )
+            if attempt == max_attempts or not retryable:
                 break
 
         agent_run.status = RunStatus.FAILED
@@ -439,8 +549,26 @@ def run_agent(issue):
             f"attempt(s): {last_failure}"
         )
         agent_run.save()
+        logger.warning(
+            "agent run %s FAILED after %s attempt(s): %s",
+            agent_run.pk, agent_run.repair_attempts, last_failure,
+        )
         return agent_run
 
     finally:
+        # Cleanup must happen on every path -- success, failure, and any
+        # unexpected exception. Log if the workspace could not be removed.
         if workspace is not None:
             shutil.rmtree(workspace, ignore_errors=True)
+            if Path(workspace).exists():
+                logger.warning(
+                    "agent run %s: temporary workspace %s could not be "
+                    "removed",
+                    agent_run.pk, workspace,
+                )
+        logger.info(
+            "agent run %s finished in %.1fs with status %s "
+            "(%s attempt(s))",
+            agent_run.pk, time.monotonic() - started, agent_run.status,
+            agent_run.repair_attempts,
+        )
