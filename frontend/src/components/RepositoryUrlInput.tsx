@@ -1,11 +1,11 @@
 import { useState, type FormEvent } from 'react'
-import { ArrowRight, CheckCircle2, Loader2 } from 'lucide-react'
-import { ApiError, parseGithubRepoUrl, startAnalysis } from '@/lib/api'
-import type { AnalysisRun } from '@/lib/api'
+import { useNavigate } from 'react-router-dom'
+import { ArrowRight, Loader2 } from 'lucide-react'
+import { ApiError, createScan, parseGithubRepoUrl } from '@/lib/api'
+import type { ScanResponse } from '@/lib/api'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Button } from '@/components/ui/button'
-
 
 function GithubMark({ className }: { className?: string }) {
   return (
@@ -20,26 +20,25 @@ function GithubMark({ className }: { className?: string }) {
   )
 }
 
-type Phase =
-  | { kind: 'idle' }
-  | { kind: 'submitting' }
-  | { kind: 'success'; run: AnalysisRun }
-  | { kind: 'error'; message: string }
-
-
-export function RepositoryInput() {
+/**
+ * The focal element of the landing page: paste a public GitHub URL, the
+ * backend fetches and analyzes the repository server-side. No account is
+ * needed to scan; AI fixes later require sign-in (stated below the input).
+ */
+export function RepositoryUrlInput() {
+  const navigate = useNavigate()
   const [value, setValue] = useState('')
-  const [phase, setPhase] = useState<Phase>({ kind: 'idle' })
+  const [submitting, setSubmitting] = useState(false)
   const [localError, setLocalError] = useState<string | null>(null)
-
-  const submitting = phase.kind === 'submitting'
+  const [submitError, setSubmitError] = useState<string | null>(null)
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (submitting) {
-      return 
+      return // double-submit guard: one scan per press
     }
 
+    // Client-side validation is convenience only; the backend re-validates.
     try {
       parseGithubRepoUrl(value)
       setLocalError(null)
@@ -47,22 +46,29 @@ export function RepositoryInput() {
       setLocalError(
         err instanceof ApiError ? err.message : 'Invalid repository URL.',
       )
-      setPhase({ kind: 'idle' })
       return
     }
 
-    setPhase({ kind: 'submitting' })
+    setSubmitting(true)
+    setSubmitError(null)
     try {
-      const run = await startAnalysis(value)
-      setPhase({ kind: 'success', run })
+      const result: ScanResponse = await createScan(value)
+      navigate(`/scan/${result.run.id}`)
     } catch (err) {
-      setPhase({
-        kind: 'error',
-        message:
-          err instanceof ApiError
-            ? err.message
-            : 'Unexpected error — please try again.',
-      })
+      if (err instanceof ApiError) {
+        // 502 after a snapshot succeeded means the analyzer failed BUT the
+        // run was recorded as failed -- send the visitor to that record
+        // instead of a bare error message.
+        const run = (err.data as ScanResponse | null)?.run
+        if (err.status === 502 && run) {
+          navigate(`/scan/${run.id}`)
+          return
+        }
+        setSubmitError(err.message)
+      } else {
+        setSubmitError('Unexpected error — please try again.')
+      }
+      setSubmitting(false)
     }
   }
 
@@ -73,13 +79,13 @@ export function RepositoryInput() {
       onSubmit={handleSubmit}
       noValidate
       className="mx-auto w-full max-w-2xl"
-      aria-label="Repository analysis"
+      aria-label="Repository scan"
     >
       <Label
         htmlFor="repository-input"
         className="mb-3 block font-mono text-[11px] tracking-[0.18em] text-muted-foreground uppercase"
       >
-        Repository input
+        Repository URL
       </Label>
 
       <div className="relative">
@@ -113,7 +119,7 @@ export function RepositoryInput() {
           type="submit"
           size="icon"
           disabled={submitting || value.trim().length === 0}
-          aria-label="Analyze repository"
+          aria-label="Scan repository"
           className="absolute top-1/2 right-2 size-9 -translate-y-1/2 rounded-sm md:size-10"
         >
           {submitting ? (
@@ -139,53 +145,27 @@ export function RepositoryInput() {
           </div>
         )}
 
-        {!localError && phase.kind === 'submitting' && (
+        {!localError && submitting && (
           <p
             aria-live="polite"
             className="font-mono text-[12px] text-muted-foreground"
           >
-            Contacting backend — saving repository and starting analysis…
+            Fetching the repository and running the analyzers — this can take
+            a minute…
           </p>
         )}
 
-        {!localError && phase.kind === 'error' && (
+        {!localError && submitError && (
           <p role="alert" className="font-mono text-[12px] text-destructive">
-            {phase.message}
+            {submitError}
           </p>
         )}
 
-        {!localError && phase.kind === 'success' && (
-          <div
-            aria-live="polite"
-            className="rounded-sm border border-border bg-card px-4 py-3"
-          >
-            <p className="flex items-center gap-2 font-mono text-[12px] tracking-wide text-add uppercase">
-              <CheckCircle2 className="size-3.5" aria-hidden="true" />
-              Analysis run created
-            </p>
-            <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 font-mono text-[12px] text-muted-foreground">
-              <dt>run</dt>
-              <dd className="text-foreground">#{phase.run.id}</dd>
-              <dt>repository</dt>
-              <dd className="text-foreground">{phase.run.repository_name}</dd>
-              <dt>status</dt>
-              <dd className="text-foreground">{phase.run.status}</dd>
-              <dt>issues</dt>
-              <dd className="text-foreground">{phase.run.issue_count}</dd>
-            </dl>
-            <p className="mt-2 text-[12px] text-muted-foreground">
-              The analysis screen that lists these issues ships in a later
-              frontend phase — the run is saved and queryable via the API.
-            </p>
-          </div>
-        )}
-
-        {!localError && phase.kind === 'idle' && (
+        {!localError && !submitting && !submitError && (
           <p className="text-[12px] text-muted-foreground">
-            Accounts are required — the backend authenticates every analysis
-            request.{' '}
+            No account needed to scan and read findings.{' '}
             <span className="text-muted-foreground/70">
-              Sign-in is not yet available in this interface.
+              AI fix generation asks you to sign in first.
             </span>
           </p>
         )}

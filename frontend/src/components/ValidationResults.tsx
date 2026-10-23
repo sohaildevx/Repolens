@@ -1,0 +1,56 @@
+import { CircleCheck, CircleX, SkipForward } from 'lucide-react'
+import type { TestResult, TestStatus } from '@/lib/api'
+
+const ICON: Record<
+  TestStatus,
+  { icon: typeof CircleCheck; className: string; label: string }
+> = {
+  passed: { icon: CircleCheck, className: 'text-add', label: 'passed' },
+  failed: { icon: CircleX, className: 'text-remove', label: 'failed' },
+  error: { icon: CircleX, className: 'text-remove', label: 'error' },
+  skipped: { icon: SkipForward, className: 'text-muted-foreground', label: 'skipped' },
+}
+
+/**
+ * Validation/test evidence recorded by the agent run. Each row shows the
+ * exact status the backend stored -- skipped and error rows are shown as
+ * themselves, never collapsed into "pass".
+ */
+export function ValidationResults({ results }: { results: TestResult[] }) {
+  if (results.length === 0) {
+    return (
+      <p className="rounded-sm border border-border bg-card/60 px-4 py-3 font-mono text-[11.5px] text-muted-foreground">
+        No validation evidence: the agent recorded no test results for this
+        run (test execution requires the optional sandbox).
+      </p>
+    )
+  }
+
+  return (
+    <section aria-label="Validation results" className="space-y-2">
+      {results.map((result) => {
+        const { icon: Icon, className, label } =
+          ICON[result.status] ?? ICON.skipped
+        return (
+          <div
+            key={result.id}
+            className="flex items-center gap-3 rounded-sm border border-border bg-card/60 px-4 py-2.5"
+          >
+            <Icon className={`size-3.5 shrink-0 ${className}`} aria-hidden="true" />
+            <code className="min-w-0 flex-1 truncate font-mono text-[12px]">
+              {result.test_name}
+            </code>
+            <span
+              className={`shrink-0 font-mono text-[10px] tracking-[0.14em] uppercase ${className}`}
+            >
+              {label}
+            </span>
+            <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
+              attempt {result.attempt}
+            </span>
+          </div>
+        )
+      })}
+    </section>
+  )
+}

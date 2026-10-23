@@ -1,4 +1,4 @@
-import { RepositoryInput } from '@/components/RepositoryInput'
+import { RepositoryUrlInput } from '@/components/RepositoryUrlInput'
 import { TechnicalMetadata } from '@/components/TechnicalMetadata'
 
 
@@ -41,12 +41,12 @@ export function HeroSection() {
         </p>
 
         <p className="mx-auto mt-4 max-w-xl text-sm leading-relaxed text-muted-foreground/90 md:text-base">
-          Analyze your Python repository, investigate potential issues, and
-          use AI to propose fixes you can validate.
+          Scan a public GitHub repository, read the real findings, and use AI
+          to propose fixes you can validate.
         </p>
 
         <div className="mt-10 md:mt-12">
-          <RepositoryInput />
+          <RepositoryUrlInput />
         </div>
 
         <div className="mt-10 flex justify-center">

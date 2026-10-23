@@ -1,19 +1,44 @@
-
+/**
+ * RepoLens API client.
+ *
+ * Talks to the Django backend through same-origin /api/... (the Vite dev
+ * server proxies to the backend; production serves both from one origin).
+ *
+ * Auth model of the current backend:
+ * - Public scans: POST /api/analysis/scans/ + all read endpoints work
+ *   anonymously (rate-limited server-side).
+ * - AI fixes (agent runs): always require a signed-in session.
+ *
+ * CSRF: SessionAuthentication re-checks CSRF on any request that carries a
+ * session. We bootstrap the csrftoken cookie once and echo it back as the
+ * X-CSRFToken header. Tokens live only in cookies/headers -- never in
+ * localStorage.
+ */
 
 export class ApiError extends Error {
   readonly status: number
+  /** Parsed response body, when one existed (e.g. a failed run record). */
+  readonly data: unknown
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, data: unknown = null) {
     super(message)
     this.name = 'ApiError'
     this.status = status
+    this.data = data
   }
 }
 
+/* ------------------------------------------------------------------ *
+ * URL validation -- client-side mirror of the backend's
+ * repositories.services.parse_github_repo_url, so users get instant
+ * feedback. The backend remains the authority; its message wins on
+ * any disagreement.
+ * ------------------------------------------------------------------ */
 
 const OWNER_RE = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/
 const REPO_RE = /^[A-Za-z0-9._-]{1,100}$/
 
+/** Validate a GitHub URL and return its canonical form. */
 export function parseGithubRepoUrl(input: string): string {
   const url = (input ?? '').trim()
   if (!url) {
@@ -31,6 +56,8 @@ export function parseGithubRepoUrl(input: string): string {
     throw new ApiError(400, 'URL must use https:// scheme.')
   }
 
+  // Authority = everything between "://" and the first "/". Reject userinfo
+  // and ANY explicit port (the backend rejects :443 as well).
   const authority = url.split('://')[1]?.split('/')[0] ?? ''
   if (authority.includes('@')) {
     throw new ApiError(400, 'URL must not contain userinfo (user@host).')
@@ -63,7 +90,16 @@ export function parseGithubRepoUrl(input: string): string {
   return `https://github.com/${owner}/${repo}`
 }
 
+/** Split a validated GitHub URL into (owner, repo). */
+export function repoParts(githubUrl: string): { owner: string; repo: string } {
+  const canonical = parseGithubRepoUrl(githubUrl)
+  const [owner, repo] = canonical.replace('https://github.com/', '').split('/')
+  return { owner, repo }
+}
 
+/* ------------------------------------------------------------------ *
+ * Transport
+ * ------------------------------------------------------------------ */
 
 let csrfReady: Promise<void> | null = null
 
@@ -74,7 +110,7 @@ function readCookie(name: string): string | null {
   return match ? decodeURIComponent(match[1]) : null
 }
 
-
+/** Fetch the CSRF cookie once per page load; retries after failures. */
 async function ensureCsrf(): Promise<void> {
   if (!csrfReady) {
     csrfReady = fetch('/api/auth/csrf/', { credentials: 'same-origin' })
@@ -87,7 +123,7 @@ async function ensureCsrf(): Promise<void> {
         }
       })
       .catch((err) => {
-        csrfReady = null 
+        csrfReady = null // allow a retry on the next request
         throw err
       })
   }
@@ -100,7 +136,7 @@ function extractDetail(data: unknown): string | null {
     if (typeof record.detail === 'string') {
       return record.detail
     }
-    
+    // DRF field errors: {"github_url": ["message"]} -- surface the first.
     for (const value of Object.values(record)) {
       if (Array.isArray(value) && typeof value[0] === 'string') {
         return value[0]
@@ -154,88 +190,165 @@ async function apiFetch<T>(
   try {
     data = await res.json()
   } catch {
-    /* non-JSON body (e.g. proxy error page) — handled below */
+    /* non-JSON body (e.g. proxy error page) -- handled below */
   }
 
   if (!res.ok) {
     throw new ApiError(
       res.status,
       extractDetail(data) ?? `Request failed (${res.status}).`,
+      data,
     )
   }
   return data as T
 }
 
+/* ------------------------------------------------------------------ *
+ * Types + endpoints
+ * ------------------------------------------------------------------ */
+
+export type RunStatus = 'pending' | 'running' | 'completed' | 'failed'
+export type Severity = 'critical' | 'high' | 'medium' | 'low' | 'info'
+export type TestStatus = 'passed' | 'failed' | 'error' | 'skipped'
 
 export interface Repository {
   id: number
   name: string
   github_url: string
-  default_branch: string | null
-  description: string | null
+  default_branch: string
+  description: string
   created_at: string
   updated_at: string
+}
+
+export interface Issue {
+  id: number
+  file_path: string
+  line_number: number
+  severity: Severity
+  rule: string
+  source: string
+  description: string
 }
 
 export interface AnalysisRun {
   id: number
   repository: number
   repository_name: string
-  status: string
+  repository_github_url: string
+  status: RunStatus
   start_time: string | null
   completion_time: string | null
-  summary: string | null
+  /** Files the analyzer examined; null = unknown (never render a fake 0). */
+  files_analyzed: number | null
+  summary: string
   created_at: string
+  issues: Issue[]
   issue_count: number
   issues_truncated: boolean
 }
 
+export interface ScanResponse {
+  run: AnalysisRun
+  repository: Repository
+}
+
+export interface AgentRun {
+  id: number
+  analysis_run: number
+  issue_id: number | null
+  status: RunStatus
+  repair_attempts: number
+  start_commit_sha: string
+  final_summary: string
+  checks: { passed: number; failed: number; error: number; skipped: number }
+  created_at: string
+  updated_at: string
+}
+
+export interface CodeChange {
+  id: number
+  file_path: string
+  proposed_diff: string
+  created_at: string
+}
+
+export interface TestResult {
+  id: number
+  test_name: string
+  status: TestStatus
+  attempt: number
+  output: string
+  created_at: string
+}
+
 interface Paginated<T> {
-  results?: T[]
+  count: number
+  next: string | null
+  previous: string | null
+  results: T[]
 }
 
-export function createRepository(githubUrl: string): Promise<Repository> {
-  return apiFetch<Repository>('/api/repositories/', {
-    method: 'POST',
-    body: { github_url: githubUrl },
-  })
-}
-
-export async function listRepositories(): Promise<Repository[]> {
-  const data = await apiFetch<Paginated<Repository> | Repository[]>(
-    '/api/repositories/?page_size=100',
-  )
-  return Array.isArray(data) ? data : (data.results ?? [])
-}
-
-export function createAnalysisRun(repositoryId: number): Promise<AnalysisRun> {
-  return apiFetch<AnalysisRun>('/api/analysis/runs/', {
-    method: 'POST',
-    body: { repository: repositoryId },
-  })
-}
-
-export async function startAnalysis(githubUrl: string): Promise<AnalysisRun> {
+/** Public scan: the backend fetches the repo server-side and analyzes it. */
+export function createScan(githubUrl: string): Promise<ScanResponse> {
   const canonical = parseGithubRepoUrl(githubUrl)
+  return apiFetch<ScanResponse>('/api/analysis/scans/', {
+    method: 'POST',
+    body: { github_url: canonical },
+  })
+}
 
-  let repo: Repository
+export function getRun(runId: number): Promise<AnalysisRun> {
+  return apiFetch<AnalysisRun>(`/api/analysis/runs/${runId}/`)
+}
+
+export function getRunIssues(
+  runId: number,
+  page = 1,
+): Promise<Paginated<Issue>> {
+  return apiFetch<Paginated<Issue>>(
+    `/api/analysis/runs/${runId}/issues/?page=${page}`,
+  )
+}
+
+export function getIssue(issueId: number): Promise<Issue> {
+  return apiFetch<Issue>(`/api/analysis/issues/${issueId}/`)
+}
+
+/** Current user, or null when anonymous (403 is the documented answer). */
+export async function getCurrentUser(): Promise<{
+  id: number
+  username: string
+} | null> {
   try {
-    repo = await createRepository(canonical)
+    return await apiFetch<{ id: number; username: string }>(
+      '/api/auth/me/',
+    )
   } catch (err) {
-    const duplicate =
-      err instanceof ApiError &&
-      err.status === 400 &&
-      /already saved/i.test(err.message)
-    if (!duplicate) {
-      throw err
+    if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
+      return null
     }
-    const existing = await listRepositories()
-    const found = existing.find((r) => r.github_url === canonical)
-    if (!found) {
-      throw err 
-    }
-    repo = found
+    throw err
   }
+}
 
-  return createAnalysisRun(repo.id)
+export function logout(): Promise<{ detail: string }> {
+  return apiFetch<{ detail: string }>('/api/auth/logout/', {
+    method: 'POST',
+  })
+}
+
+/** AI fix -- always authenticated; 401/403 means "sign in first". */
+export function createAgentRun(issueId: number): Promise<AgentRun> {
+  return apiFetch<AgentRun>(`/api/analysis/issues/${issueId}/agent-run/`, {
+    method: 'POST',
+  })
+}
+
+export function getAgentRunChanges(agentRunId: number): Promise<CodeChange[]> {
+  return apiFetch<CodeChange[]>(`/api/agent-runs/${agentRunId}/changes/`)
+}
+
+export function getAgentRunTests(agentRunId: number): Promise<TestResult[]> {
+  return apiFetch<TestResult[]>(`/api/agent-runs/${agentRunId}/tests/`)
 }
