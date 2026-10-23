@@ -8,6 +8,11 @@ app_name = "analysis"
 
 urlpatterns = [
     path(
+        "scans/",
+        views.AnalysisScanCreateView.as_view(),
+        name="scan-create",
+    ),
+    path(
         "runs/",
         views.AnalysisRunCreateView.as_view(),
         name="run-create",
@@ -21,6 +26,11 @@ urlpatterns = [
         "runs/<int:pk>/issues/",
         views.AnalysisRunIssuesView.as_view(),
         name="run-issues",
+    ),
+    path(
+        "issues/<int:pk>/",
+        views.AnalysisIssueDetailView.as_view(),
+        name="issue-detail",
     ),
     path(
         "issues/<int:issue_id>/agent-run/",

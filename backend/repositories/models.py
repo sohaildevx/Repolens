@@ -11,7 +11,12 @@ class Repository(models.Model):
         settings.AUTH_USER_MODEL,          # Django's built-in User
         on_delete=models.CASCADE,          # user deleted -> their repos deleted
         related_name="repositories",       # user.repositories.all()
-        help_text="The user who registered this repository.",
+        null=True,                         # public scans have no owner
+        blank=True,
+        help_text=(
+            "The user who registered this repository. "
+            "NULL means a public (anonymous) scan."
+        ),
     )
     github_url = models.URLField(
         max_length=2048,

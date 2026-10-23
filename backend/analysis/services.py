@@ -118,6 +118,7 @@ def run_analysis(repository, files: list[dict], user=None) -> AnalysisRun:
         # Prefer Flask's own count: non-.py files were skipped, not analyzed.
         meta = payload.get("meta") or {}
         analyzed = meta.get("files_analyzed", len(files))
+        run.files_analyzed = analyzed
         run.summary = _build_summary(analyzed, findings)
         logger.info(
             "analysis run %s completed: %s file(s), %s finding(s)",

@@ -41,6 +41,14 @@ class AnalysisRun(models.Model):
     # Nullable on purpose: a PENDING run has not started yet.
     start_time = models.DateTimeField(null=True, blank=True)
     completion_time = models.DateTimeField(null=True, blank=True)
+    # How many files the analyzer actually examined. NULL = unknown (runs
+    # recorded before this field existed, or a failed run) -- the UI must
+    # render "unavailable", never a fabricated 0.
+    files_analyzed = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Files examined by the analyzer; NULL if unknown.",
+    )
     summary = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

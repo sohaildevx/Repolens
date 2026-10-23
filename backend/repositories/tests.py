@@ -82,15 +82,29 @@ class RepositoryModelTests(TestCase):
         self.assertEqual(Repository.objects.filter(
             github_url="https://github.com/octo/hello").count(), 2)
 
-    def test_repository_requires_a_user(self):
-        """owner_id is NOT NULL at the database level."""
-        with self.assertRaises(IntegrityError):
-            with transaction.atomic():
-                Repository.objects.create(
-                    owner_id=None,
-                    github_url="https://github.com/octo/none",
-                    name="none",
-                )
+    def test_ownerless_repository_is_a_public_scan(self):
+        """owner=NULL is allowed: it marks a public (anonymous) scan.
+
+        Phase 9: the scan endpoint persists repositories without an owner.
+        Postgres treats NULLs as distinct in the unique constraint, so two
+        anonymous scans of the same URL do not collide.
+        """
+        repo = Repository.objects.create(
+            owner_id=None,
+            github_url="https://github.com/octo/none",
+            name="none",
+        )
+        self.assertIsNone(repo.owner)
+
+        # A second anonymous scan of the same URL must also succeed.
+        Repository.objects.create(
+            owner_id=None,
+            github_url="https://github.com/octo/none",
+            name="none",
+        )
+        self.assertEqual(Repository.objects.filter(
+            owner__isnull=True,
+            github_url="https://github.com/octo/none").count(), 2)
 
     def test_deleting_owner_deletes_their_repositories(self):
         """on_delete=CASCADE: user deleted -> repos deleted."""

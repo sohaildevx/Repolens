@@ -66,6 +66,26 @@ REST_FRAMEWORK = {
         'rest_framework.renderers.JSONRenderer',
         'rest_framework.renderers.BrowsableAPIRenderer',
     ],
+    # Rate limiting (DRF throttling -> Django cache, no Redis required).
+    # scan_anon: per-IP budget for anonymous public scans.
+    # scan_auth: per-user budget for signed-in scans.
+    # agent_run: per-user budget for AI agent executions (costly).
+    'DEFAULT_THROTTLE_RATES': {
+        'scan_anon': '10/hour',
+        'scan_auth': '60/hour',
+        'agent_run': '30/hour',
+    },
+}
+
+# Cache backend used by DRF throttling. LocMemCache is per-process: in a
+# multi-worker deployment the effective per-IP budget is multiplied by the
+# worker count. Acceptable for development; a shared cache (Redis) would be
+# the production answer -- deliberately not introduced in this phase.
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        'LOCATION': 'repolens-throttle',
+    }
 }
 
 # Analyzer service (Flask) -- Django calls this over HTTP.

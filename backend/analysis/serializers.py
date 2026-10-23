@@ -115,6 +115,27 @@ class AnalyzeFilesSerializer(BaseSnapshotSerializer):
     """Payload for POST /api/repositories/<id>/analyze/ (repository in URL)."""
 
 
+class ScanRequestSerializer(serializers.Serializer):
+    """Payload for POST /api/analysis/scans/ -- a public repository URL.
+
+    Validation mirrors the Phase 4 rules exactly (strict github.com host,
+    no userinfo, no ports, no path depth beyond owner/repo): the backend
+    never fetches the user-supplied string, it rebuilds its own request to
+    api.github.com from the validated components.
+    """
+
+    github_url = serializers.CharField(max_length=2048, trim_whitespace=True)
+
+    def validate_github_url(self, value):
+        from repositories.services import parse_github_repo_url
+
+        try:
+            owner, repo = parse_github_repo_url(value)
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc))
+        return f"https://github.com/{owner}/{repo}"
+
+
 class IssueSerializer(serializers.ModelSerializer):
     """Read-only representation of a saved issue."""
 
@@ -149,6 +170,9 @@ class AnalysisRunSerializer(serializers.ModelSerializer):
     repository_name = serializers.CharField(
         source="repository.name", read_only=True
     )
+    repository_github_url = serializers.CharField(
+        source="repository.github_url", read_only=True
+    )
 
     class Meta:
         model = AnalysisRun
@@ -156,9 +180,11 @@ class AnalysisRunSerializer(serializers.ModelSerializer):
             "id",
             "repository",
             "repository_name",
+            "repository_github_url",
             "status",
             "start_time",
             "completion_time",
+            "files_analyzed",
             "summary",
             "created_at",
             "issues",

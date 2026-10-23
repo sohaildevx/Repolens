@@ -1,30 +1,51 @@
 """Analysis API views.
 
-Endpoints (all require authentication):
-- POST /api/repositories/<id>/analyze/ -- spec-preferred: analyze a snapshot
-                                          of a repository you own
+Endpoints:
+- POST /api/repositories/<id>/analyze/ -- analyze a snapshot you upload
+                                           (authenticated, your repos)
 - POST /api/analysis/runs/             -- same pipeline, repository id in body
-- GET  /api/analysis/runs/<id>/        -- retrieve a run + its issues
+                                           (authenticated, your repos)
+- POST /api/analysis/scans/            -- PUBLIC: scan a GitHub repository
+                                           server-side (anonymous allowed,
+                                           rate-limited)
+- GET  /api/analysis/runs/<id>/        -- a run + its issues
+- GET  /api/analysis/runs/<id>/issues/ -- the run's issues, paginated
+- GET  /api/analysis/issues/<id>/      -- one issue (public scans or yours)
 
-Ownership is enforced by filtering on request.user: another user's
-repository or run is invisible (404, not 403), so repository/run IDs
-don't leak between accounts.
+Visibility model:
+- A repository with owner=NULL is a PUBLIC scan: its runs and issues are
+  readable by anyone (the scan was intentionally anonymous and contains
+  only public GitHub data).
+- A repository with an owner stays private: visible solely to that user,
+  answering 404 (not 403) so IDs never leak between accounts.
+- State-changing agent endpoints always require authentication; they also
+  accept issues from public scans so a signed-in user can repair what an
+  anonymous visitor found.
 
-Both POST endpoints funnel through _respond_with_run() -- one code path
-for validation -> Flask -> save -> 201/502, so the two routes can never
-disagree on behavior.
+Both analysis POST endpoints funnel through _respond_with_run() -- one
+code path for validation -> Flask -> save -> 201/502, so the two routes
+can never disagree on behavior.
 """
 
+from django.db.models import Q
 from rest_framework import status
 from rest_framework.generics import (
     CreateAPIView,
     ListAPIView,
     RetrieveAPIView,
 )
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import AnonRateThrottle, UserRateThrottle
 
 from repositories.models import Repository
+from repositories.serializers import RepositorySerializer
+from repositories.services import (
+    GitHubAPIError,
+    GitHubRateLimited,
+    GitHubRepoNotFound,
+    GitHubTimeout,
+)
 from repositories.views import RepositoryPagination
 
 from .models import AnalysisRun, AgentRun, CodeChange, Issue, RunStatus, TestResult
@@ -35,9 +56,43 @@ from .serializers import (
     AnalyzeFilesSerializer,
     CodeChangeSerializer,
     IssueSerializer,
+    ScanRequestSerializer,
     TestResultSerializer,
 )
 from .services import run_analysis
+from .snapshot import SnapshotError, fetch_github_snapshot
+
+
+class ScanAnonThrottle(AnonRateThrottle):
+    """Per-IP budget for anonymous public scans (scope: scan_anon)."""
+
+    scope = "scan_anon"
+
+
+class ScanUserThrottle(UserRateThrottle):
+    """Per-user budget for signed-in scans (scope: scan_auth)."""
+
+    scope = "scan_auth"
+
+
+class AgentRunThrottle(UserRateThrottle):
+    """Per-user budget for AI agent executions (scope: agent_run)."""
+
+    scope = "agent_run"
+
+
+def _visible_run_q(user, prefix=""):
+    """Q-filter for analysis runs the user may read.
+
+    Public scans (repository.owner IS NULL) are readable by everyone;
+    owned runs only by their owner. Anonymous users see public runs only.
+    `prefix` adapts the path when the filter is applied from a related
+    model (e.g. "analysis_run__" when filtering Issues).
+    """
+    public = Q(**{f"{prefix}repository__owner__isnull": True})
+    if getattr(user, "is_authenticated", False):
+        return public | Q(**{f"{prefix}repository__owner": user})
+    return public
 
 
 def _owned_repository(user, repository_id):
@@ -119,16 +174,116 @@ class AnalysisRunCreateView(CreateAPIView):
         )
 
 
-class AnalysisRunDetailView(RetrieveAPIView):
-    """GET /api/analysis/runs/<id>/ -- one run with its issues (bounded)."""
+class AnalysisScanCreateView(CreateAPIView):
+    """POST /api/analysis/scans/ -- scan a GitHub repository server-side.
 
-    permission_classes = [IsAuthenticated]
+    The public entry point of the product: the client sends only a URL;
+    the backend validates it (Phase 4 SSRF rules), fetches a bounded
+    Python snapshot (Phase 7 limits: 40 files, 100 KB/file, 1 MB total,
+    90 s deadline, sensitive files excluded), runs the analyzer, and
+    answers with the finished run.
+
+    Anonymous requests create an ownerless (public) repository record;
+    signed-in requests attach it to their account. A repository row is
+    persisted only AFTER the snapshot fetch succeeds, so nonexistent or
+    private repos never leave junk records behind.
+
+    Rate-limited per IP (anonymous) or per user (signed-in).
+    """
+
+    permission_classes = [AllowAny]
+    throttle_classes = [ScanAnonThrottle, ScanUserThrottle]
+    serializer_class = ScanRequestSerializer
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        canonical = serializer.validated_data["github_url"]
+
+        # Snapshot against an unsaved stand-in: fetch_github_snapshot()
+        # only reads .github_url, and nothing is persisted unless the
+        # fetch succeeds.
+        candidate = Repository(
+            owner=None,
+            github_url=canonical,
+            name=canonical.rsplit("/", 1)[-1],
+        )
+        try:
+            snapshot = fetch_github_snapshot(candidate)
+        except GitHubRepoNotFound as exc:
+            return Response(
+                {"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND
+            )
+        except GitHubRateLimited as exc:
+            return Response(
+                {"detail": str(exc)}, status=status.HTTP_429_TOO_MANY_REQUESTS
+            )
+        except GitHubTimeout as exc:
+            return Response(
+                {"detail": str(exc)},
+                status=status.HTTP_504_GATEWAY_TIMEOUT,
+            )
+        except GitHubAPIError as exc:
+            return Response(
+                {"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY
+            )
+        except SnapshotError as exc:
+            # Safe user-facing messages only (limits, no Python files, ...).
+            return Response(
+                {"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Persist now that the repository is known to exist and be readable.
+        if request.user.is_authenticated:
+            repository, _created = Repository.objects.get_or_create(
+                owner=request.user,
+                github_url=canonical,
+                defaults={
+                    "name": candidate.name,
+                    "default_branch": "main",
+                },
+            )
+        else:
+            repository = Repository.objects.create(
+                owner=None,
+                github_url=canonical,
+                name=candidate.name,
+                default_branch="main",
+            )
+
+        files = [
+            {"path": path, "content": content}
+            for path, content in snapshot.files.items()
+        ]
+        run = run_analysis(
+            repository,
+            files,
+            user=request.user if request.user.is_authenticated else None,
+        )
+
+        payload = {
+            "run": AnalysisRunSerializer(run).data,
+            "repository": RepositorySerializer(repository).data,
+        }
+        if run.status == RunStatus.FAILED:
+            return Response(payload, status=status.HTTP_502_BAD_GATEWAY)
+        return Response(payload, status=status.HTTP_201_CREATED)
+
+
+class AnalysisRunDetailView(RetrieveAPIView):
+    """GET /api/analysis/runs/<id>/ -- one run with its issues (bounded).
+
+    Readable for public scans (ownerless repositories) and for the
+    owner's own runs; anything else is a 404.
+    """
+
+    permission_classes = [AllowAny]
     serializer_class = AnalysisRunSerializer
 
     def get_queryset(self):
         return (
             AnalysisRun.objects
-            .filter(repository__owner=self.request.user)
+            .filter(_visible_run_q(self.request.user))
             .select_related("repository")
         )
 
@@ -142,28 +297,26 @@ class AnalysisRunIssuesView(ListAPIView):
     Ownership is enforced by the queryset filter (404 for foreign runs).
     """
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
     serializer_class = IssueSerializer
     pagination_class = RepositoryPagination
 
     def get_queryset(self):
         return (
             Issue.objects
-            .filter(
-                analysis_run_id=self.kwargs["pk"],
-                analysis_run__repository__owner=self.request.user,
-            )
+            .filter(_visible_run_q(self.request.user, prefix="analysis_run__"))
+            .filter(analysis_run_id=self.kwargs["pk"])
             .order_by("file_path", "line_number")
         )
 
     def list(self, request, *args, **kwargs):
-        # A list view with an ownership-filtered queryset would otherwise
+        # A list view with a visibility-filtered queryset would otherwise
         # return 200 + [] for a foreign/nonexistent run -- indistinguishable
         # from an existing run that genuinely has no issues. Check the run
         # itself first so unauthorized access stays a 404, matching every
         # other endpoint in this API (IDs never leak between accounts).
         if not AnalysisRun.objects.filter(
-            pk=self.kwargs["pk"], repository__owner=request.user
+            _visible_run_q(request.user), pk=self.kwargs["pk"]
         ).exists():
             return Response(
                 {"detail": "Analysis run not found."},
@@ -172,15 +325,35 @@ class AnalysisRunIssuesView(ListAPIView):
         return super().list(request, *args, **kwargs)
 
 
-def _owned_issue(user, issue_id):
-    """Return the user's issue, or None (caller answers 404).
+class AnalysisIssueDetailView(RetrieveAPIView):
+    """GET /api/analysis/issues/<id>/ -- one issue (deep-link target).
 
-    Ownership is repository ownership, matching every other endpoint:
-    another user's issue is invisible, so IDs never leak between accounts.
+    Readable for issues of public scans and of the caller's own runs.
+    """
+
+    permission_classes = [AllowAny]
+    serializer_class = IssueSerializer
+
+    def get(self, request, pk=None, *args, **kwargs):
+        issue = _visible_issue(request.user, pk)
+        if issue is None:
+            return Response(
+                {"detail": "Issue not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response(self.get_serializer(issue).data)
+
+
+def _visible_issue(user, issue_id):
+    """Return an issue the user may read, or None (caller answers 404).
+
+    Readable when the scan is public (repository has no owner) or owned
+    by the user -- the same rule as every run-level endpoint.
     """
     return (
         Issue.objects
-        .filter(pk=issue_id, analysis_run__repository__owner=user)
+        .filter(pk=issue_id)
+        .filter(_visible_run_q(user, prefix="analysis_run__"))
         .select_related("analysis_run__repository")
         .first()
     )
@@ -188,6 +361,10 @@ def _owned_issue(user, issue_id):
 
 class AgentRunCreateView(CreateAPIView):
     """POST /api/analysis/issues/<issue_id>/agent-run/ -- start a run.
+
+    Always requires authentication (AI fixes are never anonymous), but
+    accepts issues from public scans as well as the caller's own -- the
+    signed-in user explicitly repairs what an anonymous visitor found.
 
     Executes the agent workflow SYNCHRONOUSLY (there is no background-job
     system in this project; runs are bounded by strict limits). On success
@@ -197,10 +374,11 @@ class AgentRunCreateView(CreateAPIView):
     """
 
     permission_classes = [IsAuthenticated]
+    throttle_classes = [AgentRunThrottle]
     serializer_class = AgentRunSerializer
 
     def create(self, request, issue_id=None, *args, **kwargs):
-        issue = _owned_issue(request.user, issue_id)
+        issue = _visible_issue(request.user, issue_id)
         if issue is None:
             return Response(
                 {"detail": "Issue not found."},
@@ -235,7 +413,11 @@ class AgentRunCreateView(CreateAPIView):
 
 
 class AgentRunOwnedMixin:
-    """Shared queryset: only runs belonging to the requesting user."""
+    """Shared queryset: runs the requesting user may read.
+
+    Agent endpoints always require authentication; access covers runs of
+    public scans (ownerless repositories) and of the user's own repos.
+    """
 
     permission_classes = [IsAuthenticated]
 
@@ -244,7 +426,10 @@ class AgentRunOwnedMixin:
             AgentRun.objects
             .filter(
                 pk=self.kwargs["pk"],
-                analysis_run__repository__owner=self.request.user,
+            )
+            .filter(
+                Q(analysis_run__repository__owner__isnull=True)
+                | Q(analysis_run__repository__owner=self.request.user)
             )
             .select_related("analysis_run__repository", "issue")
             .first()

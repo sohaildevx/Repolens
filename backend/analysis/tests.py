@@ -2247,3 +2247,287 @@ class AgentEvaluationTests(TestCase):
                     out.behavior_verified,
                     f"{name}: completed without behavioral verification",
                 )
+
+
+# ---------------------------------------------------------------------------
+# Phase 9: public (anonymous) scanning -- new scan endpoint + visibility
+# ---------------------------------------------------------------------------
+
+
+class PublicScanAPITests(APITestCase):
+    """POST /api/analysis/scans/ and the public/private visibility rules."""
+
+    SCAN_URL = "/api/analysis/scans/"
+
+    def setUp(self):
+        from django.core.cache import cache
+
+        cache.clear()  # throttle counters are shared state (LocMemCache)
+        self.alice = User.objects.create_user(
+            username="scan-alice", password="Str0ng-Pass!x1"
+        )
+        self.bob = User.objects.create_user(
+            username="scan-bob", password="Str0ng-Pass!x2"
+        )
+
+    # -- helpers -----------------------------------------------------------
+
+    def _snapshot(self, files=None):
+        from .snapshot import Snapshot
+
+        return Snapshot(
+            owner="octo",
+            repo="hello",
+            commit_sha="a" * 40,
+            files=files if files is not None else {"app.py": "print(1)\n"},
+        )
+
+    def _analyzer_response(self, findings=None, analyzed=1):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "findings": findings or [],
+            "meta": {"files_analyzed": analyzed},
+        }
+        return resp
+
+    def _post_scan(self, url="https://github.com/octo/hello"):
+        return self.client.post(
+            self.SCAN_URL, {"github_url": url}, format="json"
+        )
+
+    # -- anonymous scan lifecycle -----------------------------------------
+
+    @patch("analysis.services.requests.post")
+    @patch("analysis.views.fetch_github_snapshot")
+    def test_anonymous_scan_completes_and_is_public(self, mock_snap, mock_post):
+        mock_snap.return_value = self._snapshot()
+        mock_post.return_value = self._analyzer_response()
+
+        resp = self._post_scan()
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+
+        run = AnalysisRun.objects.get(pk=resp.data["run"]["id"])
+        self.assertEqual(run.status, RunStatus.COMPLETED)
+        self.assertEqual(run.files_analyzed, 1)
+        self.assertIsNone(run.repository.owner)  # public scan
+        self.assertEqual(
+            run.repository.github_url, "https://github.com/octo/hello"
+        )
+
+        # The run is readable without any authentication.
+        detail = self.client.get(run_detail_url(run.pk))
+        self.assertEqual(detail.status_code, status.HTTP_200_OK)
+        self.assertEqual(detail.data["status"], RunStatus.COMPLETED)
+
+    @patch("analysis.views.fetch_github_snapshot")
+    def test_nonexistent_repo_is_404_and_leaves_no_junk(self, mock_snap):
+        mock_snap.side_effect = GitHubRepoNotFound(
+            "Repository not found or is private."
+        )
+
+        resp = self._post_scan("https://github.com/octo/nope")
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(Repository.objects.count(), 0)
+
+    @patch("analysis.views.fetch_github_snapshot")
+    def test_snapshot_limit_error_is_400_with_safe_message(self, mock_snap):
+        from .snapshot import SnapshotError
+
+        mock_snap.side_effect = SnapshotError(
+            "No analyzable Python files were found in the repository snapshot."
+        )
+
+        resp = self._post_scan()
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("No analyzable Python files", resp.data["detail"])
+
+    @patch("analysis.services.requests.post")
+    @patch("analysis.views.fetch_github_snapshot")
+    def test_analyzer_down_yields_502_with_failed_run(self, mock_snap, mock_post):
+        mock_snap.return_value = self._snapshot()
+        mock_post.side_effect = http_requests.ConnectionError()
+
+        resp = self._post_scan()
+        self.assertEqual(resp.status_code, status.HTTP_502_BAD_GATEWAY)
+        run = AnalysisRun.objects.get(pk=resp.data["run"]["id"])
+        self.assertEqual(run.status, RunStatus.FAILED)
+        self.assertIsNone(run.files_analyzed)  # unknown, never a fake 0
+
+    def test_invalid_url_rejected_before_any_network(self):
+        resp = self._post_scan("https://evil.example.com/o/r")
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("github.com", str(resp.data))
+
+    # -- authenticated scans ----------------------------------------------
+
+    @patch("analysis.services.requests.post")
+    @patch("analysis.views.fetch_github_snapshot")
+    def test_authenticated_scan_is_owned_and_deduplicated(self, mock_snap, mock_post):
+        mock_snap.return_value = self._snapshot()
+        mock_post.return_value = self._analyzer_response()
+        self.client.force_authenticate(user=self.alice)
+
+        first = self._post_scan()
+        second = self._post_scan()
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(second.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(
+            first.data["repository"]["id"], second.data["repository"]["id"]
+        )
+        repo = Repository.objects.get(pk=first.data["repository"]["id"])
+        self.assertEqual(repo.owner, self.alice)
+
+    # -- visibility rules --------------------------------------------------
+
+    def _owned_run(self):
+        repo = Repository.objects.create(
+            owner=self.alice,
+            github_url="https://github.com/alice/private-repo",
+            name="private-repo",
+        )
+        return AnalysisRun.objects.create(
+            repository=repo, status=RunStatus.COMPLETED
+        )
+
+    def test_private_run_is_404_for_everyone_but_owner(self):
+        run = self._owned_run()
+
+        self.assertEqual(  # anonymous
+            self.client.get(run_detail_url(run.pk)).status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+        self.client.force_authenticate(user=self.bob)
+        self.assertEqual(
+            self.client.get(run_detail_url(run.pk)).status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+        self.client.force_authenticate(user=self.alice)
+        self.assertEqual(
+            self.client.get(run_detail_url(run.pk)).status_code,
+            status.HTTP_200_OK,
+        )
+
+    @patch("analysis.services.requests.post")
+    @patch("analysis.views.fetch_github_snapshot")
+    def test_public_run_and_issue_endpoints_open_to_anonymous(self, mock_snap, mock_post):
+        mock_snap.return_value = self._snapshot(
+            files={"app.py": "import os\nos.system(1)\n"}
+        )
+        mock_post.return_value = self._analyzer_response(
+            findings=[
+                {
+                    "file_path": "app.py",
+                    "line_number": 2,
+                    "severity": "high",
+                    "rule": "B605",
+                    "source": "bandit",
+                    "description": "Start a process with a shell.",
+                }
+            ],
+            analyzed=1,
+        )
+        resp = self._post_scan()
+        run_id = resp.data["run"]["id"]
+        issue_id = resp.data["run"]["issues"][0]["id"]
+
+        self.assertEqual(  # run issues list
+            self.client.get(f"/api/analysis/runs/{run_id}/issues/").status_code,
+            status.HTTP_200_OK,
+        )
+        self.assertEqual(  # single issue (deep-link target)
+            self.client.get(f"/api/analysis/issues/{issue_id}/").status_code,
+            status.HTTP_200_OK,
+        )
+
+    def test_private_issue_is_404_for_non_owner(self):
+        run = self._owned_run()
+        issue = Issue.objects.create(
+            analysis_run=run,
+            file_path="app.py",
+            line_number=1,
+            severity=Severity.LOW,
+            description="x",
+        )
+
+        self.assertEqual(
+            self.client.get(f"/api/analysis/issues/{issue.pk}/").status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+        self.client.force_authenticate(user=self.bob)
+        self.assertEqual(
+            self.client.get(f"/api/analysis/issues/{issue.pk}/").status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    # -- authentication gate for fixes ------------------------------------
+
+    def _public_issue(self):
+        repo = Repository.objects.create(
+            owner=None,
+            github_url="https://github.com/octo/public-repo",
+            name="public-repo",
+        )
+        run = AnalysisRun.objects.create(
+            repository=repo, status=RunStatus.COMPLETED
+        )
+        return Issue.objects.create(
+            analysis_run=run,
+            file_path="app.py",
+            line_number=3,
+            severity=Severity.MEDIUM,
+            description="finding",
+        )
+
+    def test_agent_run_requires_authentication_even_for_public_issues(self):
+        issue = self._public_issue()
+        resp = self.client.post(f"/api/analysis/issues/{issue.pk}/agent-run/")
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    @patch("analysis.agent_service.run_agent")
+    def test_signed_in_user_can_repair_a_public_scan(self, mock_agent):
+        issue = self._public_issue()
+        mock_agent.return_value = AgentRun.objects.create(
+            analysis_run=issue.analysis_run,
+            issue=issue,
+            status=RunStatus.COMPLETED,
+            final_summary="Fix validated by tests on attempt 1.",
+        )
+        self.client.force_authenticate(user=self.bob)  # not the scan owner
+
+        resp = self.client.post(f"/api/analysis/issues/{issue.pk}/agent-run/")
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        self.assertIn("validated", resp.data["final_summary"])
+
+    def test_agent_run_stays_404_on_other_users_private_issues(self):
+        run = self._owned_run()
+        issue = Issue.objects.create(
+            analysis_run=run,
+            file_path="app.py",
+            line_number=1,
+            severity=Severity.LOW,
+            description="x",
+        )
+        self.client.force_authenticate(user=self.bob)
+
+        resp = self.client.post(f"/api/analysis/issues/{issue.pk}/agent-run/")
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    # -- rate limiting ------------------------------------------------------
+
+    @patch("analysis.views.ScanAnonThrottle.THROTTLE_RATES", {"scan_anon": "2/hour"})
+    @patch("analysis.services.requests.post")
+    @patch("analysis.views.fetch_github_snapshot")
+    def test_anonymous_scans_are_rate_limited_per_ip(self, mock_snap, mock_post):
+        mock_snap.return_value = self._snapshot()
+        mock_post.return_value = self._analyzer_response()
+
+        codes = [self._post_scan().status_code for _ in range(3)]
+        self.assertEqual(
+            codes,
+            [
+                status.HTTP_201_CREATED,
+                status.HTTP_201_CREATED,
+                status.HTTP_429_TOO_MANY_REQUESTS,
+            ],
+        )
