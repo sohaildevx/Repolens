@@ -187,6 +187,11 @@ async function apiFetch<T>(
  * ------------------------------------------------------------------ */
 
 export type RunStatus = 'pending' | 'running' | 'completed' | 'failed'
+export type VerificationStatus =
+  | 'verified'
+  | 'partially_verified'
+  | 'failed'
+  | 'unverified'
 export type Severity = 'critical' | 'high' | 'medium' | 'low' | 'info'
 export type TestStatus = 'passed' | 'failed' | 'error' | 'skipped'
 
@@ -236,10 +241,17 @@ export interface AgentRun {
   id: number
   analysis_run: number
   issue_id: number | null
+  /** EXECUTION status: did the workflow run? Never implies "bug fixed". */
   status: RunStatus
+  /** VERDICT, computed by the backend from checks that actually ran. */
+  verification_status: VerificationStatus
+  /** Whether repository tests executed; null = validation never reached. */
+  tests_ran: boolean | null
   repair_attempts: number
   start_commit_sha: string
   final_summary: string
+  /** AI explanation of what changed, why, and the expected behavior. */
+  explanation: string
   checks: { passed: number; failed: number; error: number; skipped: number }
   created_at: string
   updated_at: string
@@ -249,6 +261,8 @@ export interface CodeChange {
   id: number
   file_path: string
   proposed_diff: string
+  /** Which repair attempt produced this change; history is preserved. */
+  attempt: number
   created_at: string
 }
 

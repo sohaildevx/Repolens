@@ -200,7 +200,10 @@ export function FixAction({ issue }: { issue: Issue }) {
       {phase.kind === 'done' && (
         <div className="space-y-4" aria-live="polite">
           <AgentRunStatus run={phase.run} />
-          <FixProposal changes={phase.changes} />
+          <FixProposal
+            changes={phase.changes}
+            explanation={phase.run.explanation}
+          />
           <ValidationResults results={phase.tests} />
         </div>
       )}

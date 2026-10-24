@@ -64,9 +64,12 @@ const agentRun = {
   analysis_run: 1,
   issue_id: 5,
   status: 'completed' as const,
+  verification_status: 'verified' as const,
+  tests_ran: true,
   repair_attempts: 1,
   start_commit_sha: 'a'.repeat(40),
   final_summary: 'Fix validated by tests on attempt 1.',
+  explanation: 'Catch specific exceptions instead of a bare except.',
   checks: { passed: 1, failed: 0, error: 0, skipped: 2 },
   created_at: 'x',
   updated_at: 'x',
@@ -122,6 +125,7 @@ describe('FixAction', () => {
         id: 1,
         file_path: 'app.py',
         proposed_diff: '- except:\n+ except Exception:',
+        attempt: 1,
         created_at: 'x',
       },
     ])
@@ -147,8 +151,90 @@ describe('FixAction', () => {
     expect(screen.getByText(/2 skipped/)).toBeInTheDocument()
     expect(screen.getByText(/proposed patch/i)).toBeInTheDocument()
     expect(screen.getByText('test_app.py')).toBeInTheDocument()
+    // Backend verdict and explanation are rendered from real fields.
+    expect(screen.getByText('Verified')).toBeInTheDocument()
+    expect(screen.getByText(/repository tests: executed/)).toBeInTheDocument()
+    expect(screen.getByText(/what changed and why/i)).toBeInTheDocument()
+    expect(screen.getByText(agentRun.explanation)).toBeInTheDocument()
     expect(getAgentRunChanges).toHaveBeenCalledWith(11)
     expect(getAgentRunTests).toHaveBeenCalledWith(11)
+  })
+
+  it('shows a loading state while the agent runs, with no fake progress', async () => {
+    setAuth({ id: 2, username: 'alice' })
+    let resolveRun: (run: unknown) => void = () => {}
+    createAgentRun.mockImplementation(
+      () =>
+        new Promise((res) => {
+          resolveRun = res
+        }),
+    )
+    getAgentRunChanges.mockResolvedValue([])
+    getAgentRunTests.mockResolvedValue([])
+    const user = userEvent.setup()
+    renderOnIssuePage()
+
+    await user.click(
+      screen.getByRole('button', { name: /generate fix with ai/i }),
+    )
+
+    // Real progress language, no simulated percentage or early success.
+    expect(
+      screen.getByText(/snapshot, patch, validation/i),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByRole('button', { name: /generate fix with ai/i }),
+    ).toBeDisabled()
+
+    resolveRun(agentRun)
+    expect(await screen.findByText(agentRun.final_summary)).toBeInTheDocument()
+  })
+
+  it('renders partial verification distinctly from success', async () => {
+    setAuth({ id: 2, username: 'alice' })
+    createAgentRun.mockResolvedValue({
+      ...agentRun,
+      verification_status: 'partially_verified' as const,
+      tests_ran: false,
+      final_summary: 'Patch applied and static checks passed on attempt 1.',
+    })
+    getAgentRunChanges.mockResolvedValue([])
+    getAgentRunTests.mockResolvedValue([])
+    const user = userEvent.setup()
+    renderOnIssuePage()
+
+    await user.click(
+      screen.getByRole('button', { name: /generate fix with ai/i }),
+    )
+
+    const partial = await screen.findByText('Partially verified')
+    expect(partial).toHaveClass('text-primary') // copper, not green
+    expect(
+      screen.getByText(/repository tests: skipped/i),
+    ).toBeInTheDocument()
+    expect(screen.queryByText('Verified')).not.toBeInTheDocument()
+  })
+
+  it('renders a completed run whose checks failed as execution completed, verification failed', async () => {
+    setAuth({ id: 2, username: 'alice' })
+    createAgentRun.mockResolvedValue({
+      ...agentRun,
+      verification_status: 'failed' as const,
+      final_summary: 'Validation failed after 2 attempt(s): tests failed',
+      checks: { passed: 3, failed: 1, error: 0, skipped: 0 },
+    })
+    getAgentRunChanges.mockResolvedValue([])
+    getAgentRunTests.mockResolvedValue([])
+    const user = userEvent.setup()
+    renderOnIssuePage()
+
+    await user.click(
+      screen.getByRole('button', { name: /generate fix with ai/i }),
+    )
+
+    expect(await screen.findByText('Failed')).toHaveClass('text-remove')
+    expect(screen.getByText('completed')).toBeInTheDocument()
+    expect(screen.getByText(/1 failed/)).toBeInTheDocument()
   })
 
   it('surfaces the concurrent-run (409) response honestly', async () => {
