@@ -1,5 +1,6 @@
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ApiError, type Issue } from '@/lib/api'
 import { FixAction } from '@/components/FixAction'
@@ -20,7 +21,6 @@ vi.mock('@/lib/api', async (importOriginal) => {
 })
 
 vi.mock('@/lib/auth', () => ({
-  BACKEND_LOGIN_URL: '/api/auth/login/',
   useAuth: () => useAuthMock(),
 }))
 
@@ -38,6 +38,15 @@ function setAuth(user: { id: number; username: string } | null) {
     refresh,
     signOut: async () => {},
   })
+}
+
+/** Render as if the visitor is on the issue deep link. */
+function renderOnIssuePage() {
+  return render(
+    <MemoryRouter initialEntries={['/scan/1/issues/5']}>
+      <FixAction issue={issue} />
+    </MemoryRouter>,
+  )
 }
 
 const issue: Issue = {
@@ -71,22 +80,28 @@ describe('FixAction', () => {
   it('shows the sign-in gate instead of calling the agent when logged out', async () => {
     setAuth(null)
     const user = userEvent.setup()
-    render(<FixAction issue={issue} />)
+    renderOnIssuePage()
 
     await user.click(
       screen.getByRole('button', { name: /generate fix with ai/i }),
     )
 
-    const signIn = await screen.findByRole('link', { name: /open sign-in/i })
-    expect(signIn).toHaveAttribute('href', '/api/auth/login/')
-    expect(signIn).toHaveAttribute('target', '_blank')
+    const signIn = await screen.findByRole('link', {
+      name: /sign in to continue/i,
+    })
+    // Same-app route carrying this exact issue page as the return
+    // destination -- validated by safeNextPath before rendering.
+    expect(signIn).toHaveAttribute(
+      'href',
+      '/login?next=%2Fscan%2F1%2Fissues%2F5',
+    )
     expect(createAgentRun).not.toHaveBeenCalled()
   })
 
   it('re-checks the session from the gate without auto-running anything', async () => {
     setAuth(null)
     const user = userEvent.setup()
-    render(<FixAction issue={issue} />)
+    renderOnIssuePage()
 
     await user.click(
       screen.getByRole('button', { name: /generate fix with ai/i }),
@@ -121,7 +136,7 @@ describe('FixAction', () => {
       },
     ])
     const user = userEvent.setup()
-    render(<FixAction issue={issue} />)
+    renderOnIssuePage()
 
     await user.click(
       screen.getByRole('button', { name: /generate fix with ai/i }),
@@ -142,7 +157,7 @@ describe('FixAction', () => {
       new ApiError(409, 'An agent run is already in progress.'),
     )
     const user = userEvent.setup()
-    render(<FixAction issue={issue} />)
+    renderOnIssuePage()
 
     await user.click(
       screen.getByRole('button', { name: /generate fix with ai/i }),
@@ -157,14 +172,16 @@ describe('FixAction', () => {
     setAuth({ id: 2, username: 'alice' })
     createAgentRun.mockRejectedValue(new ApiError(403, 'Authentication required.'))
     const user = userEvent.setup()
-    render(<FixAction issue={issue} />)
+    renderOnIssuePage()
 
     await user.click(
       screen.getByRole('button', { name: /generate fix with ai/i }),
     )
 
     await waitFor(() => {
-      expect(screen.getByRole('link', { name: /open sign-in/i })).toBeInTheDocument()
+      expect(
+        screen.getByRole('link', { name: /sign in to continue/i }),
+      ).toHaveAttribute('href', '/login?next=%2Fscan%2F1%2Fissues%2F5')
     })
   })
 })

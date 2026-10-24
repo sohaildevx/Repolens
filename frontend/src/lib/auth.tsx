@@ -9,9 +9,6 @@ import {
 } from 'react'
 import { getCurrentUser, logout } from '@/lib/api'
 
-
-export const BACKEND_LOGIN_URL = '/api/auth/login/'
-
 interface AuthState {
   user: { id: number; username: string } | null
   loading: boolean

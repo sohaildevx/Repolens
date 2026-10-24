@@ -8,6 +8,7 @@ import {
   type AnalysisRun,
   type Issue,
 } from '@/lib/api'
+import { Spinner } from '@/components/ui/spinner'
 import { AnalysisSummary } from '@/components/AnalysisSummary'
 import { EmptyState } from '@/components/EmptyState'
 import { ErrorState } from '@/components/ErrorState'
@@ -190,7 +191,7 @@ export function ScanPage() {
                 className="inline-flex items-center gap-2 rounded-sm border border-border bg-card px-4 py-2 font-mono text-[12px] text-muted-foreground transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background focus-visible:outline-none disabled:opacity-50"
               >
                 {loadingMore && (
-                  <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
+                  <Spinner className="size-3.5" aria-label="Loading findings" />
                 )}
                 Load more findings ({issues.length} of {run.issue_count} shown)
               </button>

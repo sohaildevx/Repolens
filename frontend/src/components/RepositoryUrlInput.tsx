@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { ArrowRight, Loader2 } from 'lucide-react'
+import { ArrowRight } from 'lucide-react'
+import { Spinner } from '@/components/ui/spinner'
 import { ApiError, createScan, parseGithubRepoUrl } from '@/lib/api'
 import type { ScanResponse } from '@/lib/api'
 import { Input } from '@/components/ui/input'
@@ -123,7 +124,7 @@ export function RepositoryUrlInput() {
           className="absolute top-1/2 right-2 size-9 -translate-y-1/2 rounded-sm md:size-10"
         >
           {submitting ? (
-            <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+            <Spinner aria-label="Starting scan" />
           ) : (
             <ArrowRight className="size-4" aria-hidden="true" />
           )}

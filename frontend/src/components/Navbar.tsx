@@ -1,8 +1,11 @@
+import { useState } from 'react'
 import { Code, LogOut } from 'lucide-react'
 import { Link, useLocation } from 'react-router-dom'
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
-import { BACKEND_LOGIN_URL, useAuth } from '@/lib/auth'
+import { Spinner } from '@/components/ui/spinner'
+import { useAuth } from '@/lib/auth'
+import { loginPathFor } from '@/lib/next'
 
 const REPO_URL = 'https://github.com/sohaildevx/Repolens'
 
@@ -20,6 +23,19 @@ export function Navbar() {
   const { user, loading, signOut } = useAuth()
   const location = useLocation()
   const onLanding = location.pathname === '/'
+  const [signingOut, setSigningOut] = useState(false)
+
+  async function handleSignOut() {
+    if (signingOut) {
+      return
+    }
+    setSigningOut(true)
+    try {
+      await signOut()
+    } finally {
+      setSigningOut(false)
+    }
+  }
 
   return (
     <header className="sticky top-0 z-40 border-b border-border bg-background">
@@ -57,13 +73,19 @@ export function Navbar() {
             className="mx-1.5 hidden h-4 bg-border sm:block"
           />
 
+          {loading && (
+            <Spinner
+              className="size-3.5 text-muted-foreground"
+              aria-label="Checking session"
+            />
+          )}
           {!loading && !user && (
-            <a
-              href={BACKEND_LOGIN_URL}
+            <Link
+              to={loginPathFor(location.pathname + location.search)}
               className="rounded-sm px-3 py-2 text-[13px] text-muted-foreground transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
             >
               Sign in
-            </a>
+            </Link>
           )}
           {!loading && user && (
             <span className="hidden items-center gap-2 sm:flex">
@@ -75,11 +97,16 @@ export function Navbar() {
               </span>
               <button
                 type="button"
-                onClick={() => void signOut()}
-                aria-label="Sign out"
-                className="rounded-sm p-1.5 text-muted-foreground transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+                onClick={() => void handleSignOut()}
+                disabled={signingOut}
+                aria-label={signingOut ? 'Signing out' : 'Sign out'}
+                className="rounded-sm p-1.5 text-muted-foreground transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none disabled:opacity-60"
               >
-                <LogOut className="size-3.5" aria-hidden="true" />
+                {signingOut ? (
+                  <Spinner className="size-3.5" aria-label="Signing out" />
+                ) : (
+                  <LogOut className="size-3.5" aria-hidden="true" />
+                )}
               </button>
             </span>
           )}

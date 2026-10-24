@@ -12,12 +12,7 @@ import { ErrorState } from '@/components/ErrorState'
 import { FindingDetails } from '@/components/FindingDetails'
 import { SeverityBadge } from '@/components/SeverityBadge'
 
-/**
- * Deep-linkable issue page -- also the page visitors return to after
- * signing in (the URL itself preserves repository/analysis/issue ids, so
- * no state is stored in localStorage). Fix actions here are
- * authentication-gated in the backend; the gate UI lives in FixAction.
- */
+
 export function IssuePage() {
   const { runId, issueId } = useParams()
   const runIdNum = Number(runId)
