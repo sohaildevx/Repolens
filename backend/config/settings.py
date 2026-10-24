@@ -111,11 +111,14 @@ NEBIUS_MODEL = os.environ.get('NEBIUS_MODEL', '')
 # only applies when NEBIUS_TIMEOUT is unset in .env.
 NEBIUS_TIMEOUT_SECONDS = int(os.environ.get('NEBIUS_TIMEOUT', '120'))
 # Nebius reasoning effort for the hybrid Nemotron model (official API enum:
-# none|minimal|low|medium|high|xhigh). "low" keeps hidden reasoning far
-# below the completion budget so replies are not cut off mid-generation,
-# and cuts latency/cost. Set NEBIUS_REASONING_EFFORT=default in .env to
-# omit the parameter and use the provider default instead.
-NEBIUS_REASONING_EFFORT = os.environ.get('NEBIUS_REASONING_EFFORT', 'low')
+# none|minimal|low|medium|high|xhigh). Default "none" is evidence-based:
+# on the same real issue, low burned 15382 reasoning tokens (225s) and
+# minimal 12946 (65s) on an 848-byte file -- variance that can exceed ANY
+# completion budget and produce an empty truncated reply -- while none
+# used 0 tokens in ~1s and returned a valid, parseable patch. Set
+# NEBIUS_REASONING_EFFORT=minimal|low in .env to opt thinking back in, or
+# "default" to omit the parameter (provider default behavior).
+NEBIUS_REASONING_EFFORT = os.environ.get('NEBIUS_REASONING_EFFORT', 'none')
 
 # ---------------------------------------------------------------------------
 # Agent run -- patch generation, validation and sandbox limits.

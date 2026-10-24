@@ -48,8 +48,11 @@ logger = logging.getLogger(__name__)
 # visible reply (verified live: even "say hi" spent ~490 reasoning tokens).
 # 16384 leaves generous room for hard-case reasoning plus the JSON while
 # still capping worst-case latency and transfer for a runaway generation;
-# NEBIUS_REASONING_EFFORT (default "low") keeps everyday thinking far below
-# this ceiling, so truncation stays rare (verified live against Nebius).
+# NEBIUS_REASONING_EFFORT (default "none") removes hidden reasoning from
+# the reply entirely: measured on a real issue, low/minimal still burned
+# 12946-15382 reasoning tokens on an 848-byte file (variance that can
+# exceed any completion budget), while none generated the valid patch in
+# ~1s. The ceiling stays as a safety bound for opt-in thinking levels.
 MAX_COMPLETION_TOKENS = 16384
 
 # Official Nebius OpenAI-compatible generation knob for hybrid reasoning
@@ -141,9 +144,10 @@ def chat_json(system_prompt: str, user_prompt: str,
     truncated mid-JSON fails JSON parsing and surfaces as AIUnavailable --
     never as a silently half-applied patch.
 
-    NEBIUS_REASONING_EFFORT (default "low") bounds the hidden reasoning of
-    the hybrid Nemotron model via the official Nebius generation parameter,
-    keeping everyday thinking far below the completion budget.
+    NEBIUS_REASONING_EFFORT (default "none") removes the hybrid Nemotron
+    model's hidden reasoning via the official Nebius generation parameter,
+    so a reply can never be truncated by hidden thinking (live-measured:
+    low/minimal burned 12946-15382 reasoning tokens on a small issue).
 
     Raises:
         AIConfigurationError -- required variables missing (names only)

@@ -1122,6 +1122,18 @@ class AIServiceCallTests(SimpleTestCase):
             with override_settings(NEBIUS_REASONING_EFFORT=value):
                 self.assertEqual(_reasoning_effort_body(), {}, repr(value))
 
+    def test_default_reasoning_effort_is_none_truncation_proof(self):
+        """The shipped default must be the truncation-proof effort level.
+
+        Live evidence on a real agent issue (848-byte file): low = 15382
+        reasoning tokens / 225s, minimal = 12946 / 65s -- variance that can
+        exceed any completion budget and yield an empty truncated reply;
+        none = 0 tokens / ~1s with a valid, parse_patch-accepted patch.
+        """
+        from django.conf import settings as django_settings
+
+        self.assertEqual(django_settings.NEBIUS_REASONING_EFFORT, "none")
+
     @patch("analysis.ai_service.OpenAI")
     def test_chat_json_sends_reasoning_effort_extra_body(self, mock_openai):
         client = mock_openai.return_value
