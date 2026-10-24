@@ -25,7 +25,10 @@ class IssueAdmin(admin.ModelAdmin):
 
 @admin.register(AgentRun)
 class AgentRunAdmin(admin.ModelAdmin):
-    list_display = ("id", "analysis_run", "status", "repair_attempts", "created_at")
+    list_display = (
+        "id", "analysis_run", "status", "verification_status",
+        "repair_attempts", "created_at",
+    )
     list_filter = ("status", "created_at")
     list_select_related = ("analysis_run",)
     readonly_fields = ("created_at", "updated_at")

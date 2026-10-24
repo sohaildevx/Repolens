@@ -64,9 +64,11 @@ class EvalOutcome:
 
     case: str
     final_status: str
-    repair_attempts: int
-    patch_generated: bool
-    patch_applied: bool
+    verification_status: str = ""
+    tests_ran: object = None          # True / False / None (not reached)
+    repair_attempts: int = 0
+    patch_generated: bool = False
+    patch_applied: bool = False
     checks_executed: list = field(default_factory=list)
     check_statuses: dict = field(default_factory=dict)
     initial_test_result: str = ""
@@ -79,6 +81,8 @@ class EvalOutcome:
         return {
             "case": self.case,
             "final_status": self.final_status,
+            "verification_status": self.verification_status,
+            "tests_ran": self.tests_ran,
             "repair_attempts": self.repair_attempts,
             "patch_generated": self.patch_generated,
             "patch_applied": self.patch_applied,
@@ -123,12 +127,7 @@ def _clean_analyzer():
     return {"summary": "clean", "files_analyzed": 1, "issues": []}
 
 
-# ---------------------------------------------------------------------------
-# Trusted regression checks (first-party fixture code)
-# ---------------------------------------------------------------------------
 
-# Each snippet runs with the patched module imported as `candidate`. A non-zero
-# exit (an AssertionError, a crash, or a timeout) means behavior is NOT fixed.
 
 _CHECK_ADD = "assert candidate.add(2, 3) == 5, candidate.add(2, 3)\n"
 
@@ -177,7 +176,8 @@ _register(EvalCase(
     },
     ai_replies=[
         {"path": "app.py", "old_code": "return a - b",
-         "new_code": "return a + b"},
+         "new_code": "return a + b",
+         "explanation": "Replace the subtraction with addition."},
     ],
     sandbox_results=[SandboxResult(0, "OK")],
     regression_check=_CHECK_ADD,
@@ -209,6 +209,10 @@ _register(EvalCase(
              "    if not numbers:\n"
              "        return 0\n"
              "    return total / len(numbers)"
+         ),
+         "explanation": (
+             "Guard against an empty list before dividing, returning 0 "
+             "for the mean of no numbers."
          )},
     ],
     sandbox_results=[SandboxResult(0, "OK")],
@@ -230,7 +234,8 @@ _register(EvalCase(
     # the agent); here the model produces a valid patch over valid content.
     ai_replies=[
         {"path": "broken.py", "old_code": "return x / 2",
-         "new_code": "return x // 2"},
+         "new_code": "return x // 2",
+         "explanation": "Use floor division so half() returns an int."},
     ],
     sandbox_results=[SandboxResult(0, "OK")],
     regression_check="assert candidate.half(5) == 2\n",
@@ -247,8 +252,10 @@ _register(EvalCase(
         "rule": "AST001", "source": "ast", "description": "Wrong operator.",
     },
     ai_replies=[
-        {"path": "nope.py", "old_code": "x", "new_code": "y"},
-        {"path": "nope.py", "old_code": "x", "new_code": "y"},
+        {"path": "nope.py", "old_code": "x", "new_code": "y",
+         "explanation": "Attempted fix for the reported bug."},
+        {"path": "nope.py", "old_code": "x", "new_code": "y",
+         "explanation": "Attempted fix for the reported bug."},
     ],
     sandbox_results=[SandboxResult(0, "OK"), SandboxResult(0, "OK")],
 ))
@@ -265,9 +272,11 @@ _register(EvalCase(
     },
     ai_replies=[
         {"path": "app.py", "old_code": "return a * b",
-         "new_code": "return a + b"},
+         "new_code": "return a + b",
+         "explanation": "Replace the wrong operator with addition."},
         {"path": "app.py", "old_code": "return a * b",
-         "new_code": "return a + b"},
+         "new_code": "return a + b",
+         "explanation": "Replace the wrong operator with addition."},
     ],
     sandbox_results=[SandboxResult(0, "OK"), SandboxResult(0, "OK")],
 ))
@@ -284,9 +293,11 @@ _register(EvalCase(
     },
     ai_replies=[
         {"path": "app.py", "old_code": "return a - b",
-         "new_code": "return a + b"},
+         "new_code": "return a + b",
+         "explanation": "Replace the subtraction with addition."},
         {"path": "app.py", "old_code": "return a - b",
-         "new_code": "return a + b"},
+         "new_code": "return a + b",
+         "explanation": "Replace the subtraction with addition."},
     ],
     sandbox_results=[SandboxResult(1, "FAILED test_add"),
                      SandboxResult(0, "OK")],
@@ -305,9 +316,11 @@ _register(EvalCase(
     },
     ai_replies=[
         {"path": "app.py", "old_code": "return a - b",
-         "new_code": "return a + b"},
+         "new_code": "return a + b",
+         "explanation": "Replace the subtraction with addition."},
         {"path": "app.py", "old_code": "return a - b",
-         "new_code": "return a + b"},
+         "new_code": "return a + b",
+         "explanation": "Replace the subtraction with addition."},
     ],
     sandbox_results=[SandboxResult(1, "FAILED"), SandboxResult(1, "FAILED")],
     regression_check=_CHECK_ADD,
@@ -325,9 +338,11 @@ _register(EvalCase(
     },
     ai_replies=[
         {"path": "app.py", "old_code": "return a - b",
-         "new_code": "return a + b"},
+         "new_code": "return a + b",
+         "explanation": "Replace the subtraction with addition."},
         {"path": "app.py", "old_code": "return a - b",
-         "new_code": "return a + b"},
+         "new_code": "return a + b",
+         "explanation": "Replace the subtraction with addition."},
     ],
     sandbox_results=[
         SandboxResult(returncode=None, output="Sandbox execution timed out.",
@@ -349,7 +364,8 @@ _register(EvalCase(
     },
     ai_replies=[
         {"path": "app.py", "old_code": "return a - b",
-         "new_code": "return a + b"},
+         "new_code": "return a + b",
+         "explanation": "Replace the subtraction with addition."},
     ],
     sandbox_results=[None],
     regression_check=_CHECK_ADD,
@@ -375,6 +391,10 @@ _register(EvalCase(
          "new_code": (
              "    cleaned = ''.join(c.lower() for c in text if c.isalnum())\n"
              "    return cleaned == cleaned[::-1]"
+         ),
+         "explanation": (
+             "Normalize the text by lowercasing and keeping only "
+             "alphanumeric characters before comparing."
          )},
     ],
     sandbox_results=[SandboxResult(0, "OK")],
@@ -515,6 +535,8 @@ def evaluate_case(case: EvalCase, user=None) -> EvalOutcome:
     return EvalOutcome(
         case=case.name,
         final_status=agent_run.status,
+        verification_status=agent_run.verification_status,
+        tests_ran=agent_run.tests_ran,
         repair_attempts=agent_run.repair_attempts,
         patch_generated=patch_generated,
         patch_applied=patch_applied,

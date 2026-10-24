@@ -21,6 +21,7 @@ from .ai_service import (
     AIConfigurationError,
     AITimeout,
     AIUnavailable,
+    _reasoning_effort_body,
     chat_json,
     is_configured,
 )
@@ -33,6 +34,7 @@ from .models import (
     Severity,
     TestResult,
     TestStatus,
+    VerificationStatus,
 )
 from .services import (
     AnalyzerTimeout,
@@ -916,10 +918,12 @@ class AIServiceCallTests(SimpleTestCase):
     MODEL = "nvidia/nemotron-3-super-120b-a12b"
 
     @staticmethod
-    def _response(raw):
+    def _response(raw, finish_reason=None):
         resp = MagicMock()
         choice = MagicMock()
         choice.message.content = raw
+        if finish_reason is not None:
+            choice.finish_reason = finish_reason
         resp.choices = [choice]
         return resp
 
@@ -1006,6 +1010,29 @@ class AIServiceCallTests(SimpleTestCase):
         self.assertIn("empty", str(ctx.exception))
 
     @patch("analysis.ai_service.OpenAI")
+    def test_empty_reply_cut_by_token_limit_is_specific(self, mock_openai):
+        """A reasoning model can burn the whole budget on hidden thinking.
+
+        finish_reason == "length" with no visible content must be reported
+        as a token-limit truncation, not as a generic empty response.
+        """
+        mock_openai.return_value.chat.completions.create.return_value = \
+            self._response("", finish_reason="length")
+        with self.assertRaises(AIUnavailable) as ctx:
+            chat_json("s", "u")
+        self.assertIn("token limit", str(ctx.exception))
+        self.assertNotIn("empty response", str(ctx.exception))
+
+    @patch("analysis.ai_service.OpenAI")
+    def test_truncated_json_reports_token_limit(self, mock_openai):
+        """Cut-off mid-JSON is diagnosed as truncation, not malformed JSON."""
+        mock_openai.return_value.chat.completions.create.return_value = \
+            self._response('{"path": "ap', finish_reason="length")
+        with self.assertRaises(AIUnavailable) as ctx:
+            chat_json("s", "u")
+        self.assertIn("token limit", str(ctx.exception))
+
+    @patch("analysis.ai_service.OpenAI")
     def test_auth_error_mapped_without_leaking_key(self, mock_openai):
         mock_openai.return_value.chat.completions.create.side_effect = (
             openai_auth_error()
@@ -1075,6 +1102,79 @@ class AIServiceCallTests(SimpleTestCase):
                 chat_json("s", "u")
         mock_openai.return_value.chat.completions.create.assert_not_called()
 
+    def test_reasoning_effort_valid_value_is_forwarded(self):
+        """The official Nebius reasoning_effort knob maps to extra_body."""
+        with override_settings(NEBIUS_REASONING_EFFORT="low"):
+            self.assertEqual(
+                _reasoning_effort_body(),
+                {"extra_body": {"reasoning_effort": "low"}},
+            )
+        for value in ("NONE", "xhigh"):
+            with override_settings(NEBIUS_REASONING_EFFORT=value):
+                self.assertEqual(
+                    _reasoning_effort_body(),
+                    {"extra_body": {"reasoning_effort": value.lower()}},
+                )
+
+    def test_reasoning_effort_empty_default_or_unknown_is_omitted(self):
+        """No parameter is sent unless the effort is a real enum value."""
+        for value in ("", "default", "  DEFAULT  ", "turbo", None):
+            with override_settings(NEBIUS_REASONING_EFFORT=value):
+                self.assertEqual(_reasoning_effort_body(), {}, repr(value))
+
+    @patch("analysis.ai_service.OpenAI")
+    def test_chat_json_sends_reasoning_effort_extra_body(self, mock_openai):
+        client = mock_openai.return_value
+        client.chat.completions.create.return_value = self._response(
+            '{"ok": true}'
+        )
+        with override_settings(NEBIUS_REASONING_EFFORT="minimal"):
+            chat_json("Return JSON.", "hello")
+        create_kwargs = client.chat.completions.create.call_args.kwargs
+        self.assertEqual(
+            create_kwargs["extra_body"], {"reasoning_effort": "minimal"}
+        )
+
+    @patch("analysis.ai_service.OpenAI")
+    def test_server_5xx_is_reported_as_temporary(self, mock_openai):
+        """Token Factory endpoints cold-start into 503s (verified live).
+
+        That is a temporary condition, not an auth/config problem; only
+        the status code reaches the message, never the response body.
+        """
+        import openai as openai_sdk
+
+        mock_openai.return_value.chat.completions.create.side_effect = (
+            openai_sdk.APIStatusError(
+                "503 no capacity",
+                response=httpx2.Response(503, request=self._request()),
+                body=None,
+            )
+        )
+        with self.assertRaises(AIUnavailable) as ctx:
+            chat_json("s", "u")
+        msg = str(ctx.exception)
+        self.assertIn("temporarily unavailable", msg)
+        self.assertIn("503", msg)
+        self.assertNotIn(self.KEY, msg)
+
+    @patch("analysis.ai_service.OpenAI")
+    def test_server_4xx_status_is_safe_generic_message(self, mock_openai):
+        import openai as openai_sdk
+
+        mock_openai.return_value.chat.completions.create.side_effect = (
+            openai_sdk.APIStatusError(
+                "400 bad request",
+                response=httpx2.Response(400, request=self._request()),
+                body=None,
+            )
+        )
+        with self.assertRaises(AIUnavailable) as ctx:
+            chat_json("s", "u")
+        msg = str(ctx.exception)
+        self.assertIn("HTTP 400", msg)
+        self.assertNotIn(self.KEY, msg)
+
 
 def openai_auth_error():
     import openai as openai_sdk
@@ -1121,7 +1221,12 @@ from .snapshot import (
 
 BUGGY_SOURCE = "def add(a, b):\n    return a - b\n"
 FIXED_SOURCE = "def add(a, b):\n    return a + b\n"
-GOOD_PATCH = {"path": "app.py", "old_code": "return a - b", "new_code": "return a + b"}
+GOOD_PATCH = {
+    "path": "app.py",
+    "old_code": "return a - b",
+    "new_code": "return a + b",
+    "explanation": "Replace the subtraction with addition.",
+}
 CLEAN_ANALYZER = {"summary": "clean", "files_analyzed": 1, "issues": []}
 
 # Sentinel: distinguishes "no sandbox argument" (use default) from an
@@ -1245,6 +1350,21 @@ class PatchingUnitTests(SimpleTestCase):
         bad = {"path": "app.py", "old_code": "x = 1", "new_code": "x = 2"}
         with self.assertRaises(PatchError):
             parse_patch(bad, snap)
+
+    def test_mismatch_message_teaches_byte_exact_copy(self):
+        """The rejection doubles as actionable retry feedback for the model.
+
+        A model that quoted the snippet imperfectly must be told HOW to
+        correct it: byte-for-byte, same indentation and quotes.
+        """
+        snap = make_snapshot({"app.py": "x = 1\n"})
+        bad = {"path": "app.py", "old_code": "  nope  ", "new_code": "y = 2",
+               "explanation": "change it"}
+        with self.assertRaises(PatchError) as ctx:
+            parse_patch(bad, snap)
+        msg = str(ctx.exception)
+        self.assertIn("does not match the snapshot file", msg)
+        self.assertIn("byte-for-byte", msg)
 
     def test_make_diff_has_headers_and_change(self):
         diff = make_diff("app.py", BUGGY_SOURCE, FIXED_SOURCE)
@@ -1439,6 +1559,63 @@ class SnapshotUnitTests(SimpleTestCase):
         for p in ("app.py", "src/main.py", "environment.py"):
             self.assertFalse(is_sensitive_path(p), p)
 
+    def test_context_for_small_file_returned_whole(self):
+        snap = make_snapshot({"app.py": "x = 1\n"})
+        self.assertEqual(snap.context_for("app.py", 100), "x = 1\n")
+
+    def test_context_for_big_file_head_fallback_without_focus(self):
+        big = "".join(f"# line {i}\n" for i in range(1, 2001))
+        snap = make_snapshot({"app.py": big})
+        out = snap.context_for("app.py", 200)
+        self.assertTrue(out.startswith("# line 1\n"))
+        self.assertIn("[truncated for prompt size]", out)
+        self.assertLessEqual(len(out), 200 + 40)
+
+    def test_context_for_big_file_centers_on_focus_line(self):
+        """A production-scale file must show the BUGGY line, not just its head.
+
+        With head-truncation alone, an issue at line 1500 of a big file
+        could never be patched exactly, because the model never saw it.
+        """
+        big = "".join(f"# line {i}\n" for i in range(1, 2001))
+        snap = make_snapshot({"app.py": big})
+        out = snap.context_for("app.py", 200, focus_line=1500)
+        self.assertIn("# line 1500\n", out)
+        self.assertIn("[earlier lines omitted]", out)
+        self.assertIn("[later lines omitted]", out)
+        self.assertNotIn("# line 1\n", out)  # the old head is gone
+        self.assertLessEqual(len(out), 300)
+
+    def test_context_for_focus_near_file_start_has_no_prefix_marker(self):
+        big = "".join(f"# line {i}\n" for i in range(1, 2001))
+        snap = make_snapshot({"app.py": big})
+        out = snap.context_for("app.py", 200, focus_line=3)
+        self.assertIn("# line 3\n", out)
+        self.assertNotIn("[earlier lines omitted]", out)
+        self.assertIn("[later lines omitted]", out)
+
+    def test_focus_window_keeps_lines_whole_when_budget_is_tight(self):
+        """The hard byte bound must never leave a HALF line in the prompt.
+
+        Regression: chunk[:max_bytes] cut the boundary line mid-way (its
+        head became a phantom short line); a model quoting that fragment
+        byte-for-byte could never match the real file.
+        """
+        big = "".join(
+            f"# line {i:04d} {'y' * 36}\n" for i in range(1, 61)
+        )
+        snap = make_snapshot({"app.py": big})
+        out = snap.context_for("app.py", 300, focus_line=30)
+        self.assertIn("# line 0030", out)  # the focused line survives
+        body = out.removeprefix("... [earlier lines omitted] ...\n")
+        body = body.removesuffix("\n... [later lines omitted] ...")
+        self.assertGreater(len(body), 0)
+        segments = body.splitlines(keepends=True)
+        self.assertTrue(
+            all(seg.endswith("\n") for seg in segments),
+            "a half line leaked into the prompt window",
+        )
+
     def test_fetch_happy_path_records_commit_sha(self):
         blob = _base64.b64encode(BUGGY_SOURCE.encode()).decode()
         responses = [
@@ -1618,6 +1795,10 @@ class AgentServiceTests(AgentFixtureMixin, TestCase):
     def test_successful_run_completes_and_persists(self):
         run = self._run_with()
         self.assertEqual(run.status, RunStatus.COMPLETED)
+        # Execution completed AND every required check passed: verified.
+        self.assertEqual(run.verification_status, VerificationStatus.VERIFIED)
+        self.assertIs(run.tests_ran, True)
+        self.assertIn("addition", run.explanation)
         self.assertEqual(run.repair_attempts, 1)
         self.assertEqual(run.start_commit_sha, "a" * 40)
         self.assertIn("attempt 1", run.final_summary)
@@ -1625,6 +1806,7 @@ class AgentServiceTests(AgentFixtureMixin, TestCase):
         changes = list(run.code_changes.all())
         self.assertEqual(len(changes), 1)
         self.assertEqual(changes[0].file_path, "app.py")
+        self.assertEqual(changes[0].attempt, 1)
         self.assertIn("+    return a + b", changes[0].proposed_diff)
 
         results = {r.test_name: r.status for r in run.test_results.all()}
@@ -1655,17 +1837,32 @@ class AgentServiceTests(AgentFixtureMixin, TestCase):
         run = self._run_with(snapshot=snap)
         self.assertEqual(run.status, RunStatus.FAILED)
         self.assertIn("not present in the fetched snapshot", run.final_summary)
+        # No source context -> no patch, no checks -> nothing to verify.
+        self.assertEqual(run.verification_status, VerificationStatus.UNVERIFIED)
+        self.assertIsNone(run.tests_ran)
 
     def test_invalid_ai_patch_gets_one_retry_then_fails(self):
-        bad = {"path": "nope.py", "old_code": "x", "new_code": "y"}
+        bad = {"path": "nope.py", "old_code": "x", "new_code": "y",
+               "explanation": "bad"}
         run = self._run_with(chat=[bad, bad])
         self.assertEqual(run.status, RunStatus.FAILED)
+        self.assertEqual(run.verification_status, VerificationStatus.UNVERIFIED)
         self.assertEqual(run.repair_attempts, 2)
         self.assertIn("invalid AI patch", run.final_summary)
         self.assertEqual(run.code_changes.count(), 0)
+        # Both rejections are recorded, tagged per attempt (history kept).
+        rejections = list(run.test_results.filter(test_name="patch"))
+        self.assertEqual(len(rejections), 2)
+        self.assertEqual({r.attempt for r in rejections}, {1, 2})
+        self.assertTrue(all(r.status == TestStatus.ERROR for r in rejections))
+        # Bounded forensics: the rejected snippet head is preserved so a
+        # whitespace/quote mismatch becomes diagnosable from the UI alone.
+        self.assertIn("Proposed old_code (first 300 chars): x",
+                      rejections[0].output)
 
     def test_retry_after_invalid_patch_succeeds(self):
-        bad = {"path": "nope.py", "old_code": "x", "new_code": "y"}
+        bad = {"path": "nope.py", "old_code": "x", "new_code": "y",
+               "explanation": "bad"}
         run = self._run_with(chat=[bad, GOOD_PATCH])
         self.assertEqual(run.status, RunStatus.COMPLETED)
         self.assertEqual(run.repair_attempts, 2)
@@ -1710,7 +1907,11 @@ class AgentServiceTests(AgentFixtureMixin, TestCase):
                         "rule": "E1", "description": "style"}],
         }
         run = self._run_with(analyzer=[dirty, dirty])
-        self.assertEqual(run.status, RunStatus.FAILED)
+        # Execution ran its validation phase -> completed; the failing
+        # static check is a verification verdict, not an execution crash.
+        self.assertEqual(run.status, RunStatus.COMPLETED)
+        self.assertEqual(run.verification_status, VerificationStatus.FAILED)
+        self.assertIs(run.tests_ran, True)
         self.assertEqual(run.repair_attempts, 2)
         self.assertIn("static-analysis", run.final_summary)
 
@@ -1725,7 +1926,12 @@ class AgentServiceTests(AgentFixtureMixin, TestCase):
             side_effect=AnalyzerUnavailable("Analyzer is down."),
         ) as mock_call:
             run = run_agent(self.issue)
-        self.assertEqual(run.status, RunStatus.FAILED)
+        # The analyzer died mid-validation: execution completed, but the
+        # evidence is incomplete -- partially verified, never verified.
+        self.assertEqual(run.status, RunStatus.COMPLETED)
+        self.assertEqual(
+            run.verification_status, VerificationStatus.PARTIALLY_VERIFIED
+        )
         self.assertEqual(run.repair_attempts, 1)
         mock_call.assert_called_once()
         results = {r.test_name: r.status for r in run.test_results.all()}
@@ -1734,7 +1940,8 @@ class AgentServiceTests(AgentFixtureMixin, TestCase):
     def test_syntax_broken_patch_fails_and_retries(self):
         broken = dict(GOOD_PATCH, new_code="def add(a, b:\n    return 0\n")
         run = self._run_with(chat=[broken, broken])
-        self.assertEqual(run.status, RunStatus.FAILED)
+        self.assertEqual(run.status, RunStatus.COMPLETED)
+        self.assertEqual(run.verification_status, VerificationStatus.FAILED)
         self.assertEqual(run.repair_attempts, 2)
         results = {r.test_name: r.status for r in run.test_results.all()}
         self.assertEqual(results["syntax:app.py"], TestStatus.FAILED)
@@ -1742,6 +1949,11 @@ class AgentServiceTests(AgentFixtureMixin, TestCase):
     def test_sandbox_unavailable_records_skipped_and_completes(self):
         run = self._run_with(sandbox=None)
         self.assertEqual(run.status, RunStatus.COMPLETED)
+        # Skipped tests can never produce "verified": only partially.
+        self.assertEqual(
+            run.verification_status, VerificationStatus.PARTIALLY_VERIFIED
+        )
+        self.assertIs(run.tests_ran, False)
         tests_row = run.test_results.get(test_name="tests")
         self.assertEqual(tests_row.status, TestStatus.SKIPPED)
         self.assertIn("NOT run", tests_row.output)
@@ -1752,6 +1964,9 @@ class AgentServiceTests(AgentFixtureMixin, TestCase):
         second = SandboxResult(0, "OK")
         run = self._run_with(sandbox=[first, second])
         self.assertEqual(run.status, RunStatus.COMPLETED)
+        # The failed first attempt does not taint the final verdict.
+        self.assertEqual(run.verification_status, VerificationStatus.VERIFIED)
+        self.assertIs(run.tests_ran, True)
         self.assertEqual(run.repair_attempts, 2)
         rows = [
             (r.attempt, r.status) for r in
@@ -1949,12 +2164,14 @@ class Phase8ReliabilityTests(AgentFixtureMixin, TestCase):
         ):
             return run_agent(self.issue)
 
-    # -- Bug 1: duplicate CodeChange rows across retry attempts -------------
+    # -- attempt history must be PRESERVED (STEP F) --------------------------
 
-    def test_two_attempt_run_leaves_exactly_one_code_change(self):
-        """A retry must replace the prior diff, not append a second one.
+    def test_two_attempt_run_preserves_both_attempts_changes(self):
+        """Both attempts' diffs stay on record, tagged by attempt.
 
-        Both attempts edit app.py; only the final diff should survive.
+        The final verdict only concerns the last attempt, but the earlier
+        patch must remain inspectable -- a later success never erases an
+        earlier failure.
         """
         first = SandboxResult(1, "FAILED attempt 1")
         second = SandboxResult(0, "OK")
@@ -1963,10 +2180,15 @@ class Phase8ReliabilityTests(AgentFixtureMixin, TestCase):
         self.assertEqual(run.repair_attempts, 2)
         changes = list(run.code_changes.all())
         self.assertEqual(
-            len(changes), 1,
-            f"expected 1 CodeChange after a 2-attempt run, got {len(changes)}",
+            len(changes), 2,
+            f"expected 2 CodeChanges (one per attempt), got {len(changes)}",
         )
-        self.assertEqual(changes[0].file_path, "app.py")
+        self.assertEqual({c.attempt for c in changes}, {1, 2})
+        self.assertTrue(all(c.file_path == "app.py" for c in changes))
+        # The verdict reflects only the final attempt's evidence.
+        self.assertEqual(
+            run.verification_status, VerificationStatus.VERIFIED
+        )
 
     # -- Bug 2: analyzer tool crash must NOT become a false pass ------------
 
@@ -1980,7 +2202,12 @@ class Phase8ReliabilityTests(AgentFixtureMixin, TestCase):
                         "description": "Ruff could not be executed."}],
         }
         run = self._run_with(analyzer=[tool_crash, tool_crash])
-        self.assertEqual(run.status, RunStatus.FAILED)
+        # Execution completed; the crashed linter leaves the evidence
+        # incomplete -> partially verified, NEVER verified.
+        self.assertEqual(run.status, RunStatus.COMPLETED)
+        self.assertEqual(
+            run.verification_status, VerificationStatus.PARTIALLY_VERIFIED
+        )
         results = {r.test_name: r.status for r in run.test_results.all()}
         self.assertEqual(results["static-analysis"], TestStatus.ERROR)
         # A dead linter is not retryable -- no wasted repair attempt.
@@ -1996,7 +2223,10 @@ class Phase8ReliabilityTests(AgentFixtureMixin, TestCase):
                         "description": "Bandit timed out."}],
         }
         run = self._run_with(analyzer=[tool_timeout, tool_timeout])
-        self.assertEqual(run.status, RunStatus.FAILED)
+        self.assertEqual(run.status, RunStatus.COMPLETED)
+        self.assertEqual(
+            run.verification_status, VerificationStatus.PARTIALLY_VERIFIED
+        )
         results = {r.test_name: r.status for r in run.test_results.all()}
         self.assertEqual(results["static-analysis"], TestStatus.ERROR)
 
@@ -2008,39 +2238,52 @@ class Phase8ReliabilityTests(AgentFixtureMixin, TestCase):
 
         with override_settings(AGENT_MAX_REPAIR_ATTEMPTS=1):
             self.assertEqual(_max_attempts(), 1)
-        with override_settings(AGENT_MAX_REPAIR_ATTEMPTS=3):
-            self.assertEqual(_max_attempts(), 3)
+        with override_settings(AGENT_MAX_REPAIR_ATTEMPTS=2):
+            self.assertEqual(_max_attempts(), 2)
 
     def test_max_repair_attempts_is_clamped(self):
-        """Out-of-range config values are clamped, never trusted blindly."""
+        """Out-of-range config values are clamped, never trusted blindly.
+
+        The workflow allows at most ONE additional repair attempt, so the
+        ceiling is 2 no matter what the environment claims.
+        """
         from .agent_service import _max_attempts
 
         with override_settings(AGENT_MAX_REPAIR_ATTEMPTS=0):
             self.assertEqual(_max_attempts(), 1)   # floor
         with override_settings(AGENT_MAX_REPAIR_ATTEMPTS=99):
-            self.assertEqual(_max_attempts(), 5)   # ceiling
+            self.assertEqual(_max_attempts(), 2)   # ceiling
 
     def test_single_attempt_setting_stops_after_one(self):
         """With attempts=1, a failing run makes exactly one attempt."""
         with override_settings(AGENT_MAX_REPAIR_ATTEMPTS=1):
             run = self._run_with(sandbox=SandboxResult(1, "FAILED"))
-        self.assertEqual(run.status, RunStatus.FAILED)
+        # Execution ran to its verdict; the failing check is a
+        # verification failure, not an execution crash.
+        self.assertEqual(run.status, RunStatus.COMPLETED)
+        self.assertEqual(run.verification_status, VerificationStatus.FAILED)
         self.assertEqual(run.repair_attempts, 1)
 
     # -- Bug 4: no overclaiming "validated" when tests are skipped ----------
 
     def test_skipped_tests_do_not_claim_validated(self):
-        """A completed run with skipped tests says UNVERIFIED, not validated."""
+        """A completed run with skipped tests is partially verified only."""
         run = self._run_with(sandbox=None)
         self.assertEqual(run.status, RunStatus.COMPLETED)
         self.assertNotIn("validated by tests", run.final_summary)
-        self.assertIn("UNVERIFIED", run.final_summary)
+        self.assertIn("were not executed", run.final_summary.lower())
+        self.assertEqual(
+            run.verification_status, VerificationStatus.PARTIALLY_VERIFIED
+        )
+        self.assertIs(run.tests_ran, False)
 
     def test_tests_run_summary_claims_validated_by_tests(self):
         """When tests genuinely ran and passed, 'validated by tests' is OK."""
         run = self._run_with(sandbox=SandboxResult(0, "OK"))
         self.assertEqual(run.status, RunStatus.COMPLETED)
         self.assertIn("validated by tests", run.final_summary)
+        self.assertEqual(run.verification_status, VerificationStatus.VERIFIED)
+        self.assertIs(run.tests_ran, True)
 
     # -- Bug 5: static-check helper returns a uniform 3-tuple ---------------
 
@@ -2174,14 +2417,22 @@ class AgentEvaluationTests(TestCase):
 
     def test_repair_still_fails_reports_failed(self):
         out = self._eval("repair_still_fails")
-        self.assertEqual(out.final_status, RunStatus.FAILED)
+        # Execution completed its validation phase; the FIX failed
+        # verification -- exactly the separation the spec demands.
+        self.assertEqual(out.final_status, RunStatus.COMPLETED)
+        self.assertEqual(out.verification_status,
+                         VerificationStatus.FAILED)
+        self.assertIs(out.tests_ran, True)
         self.assertEqual(out.repair_attempts, 2)
         self.assertEqual(out.final_test_result, TestStatus.FAILED)
 
     def test_sandbox_timeout_is_error_not_pass(self):
         out = self._eval("sandbox_timeout")
-        self.assertEqual(out.final_status, RunStatus.FAILED)
+        self.assertEqual(out.final_status, RunStatus.COMPLETED)
         self.assertEqual(out.final_test_result, TestStatus.ERROR)
+        # A timed-out suite is incomplete evidence: partially verified.
+        self.assertEqual(out.verification_status,
+                         VerificationStatus.PARTIALLY_VERIFIED)
 
     # -- Docker unavailable: skipped, never passed --------------------------
 
@@ -2194,7 +2445,10 @@ class AgentEvaluationTests(TestCase):
         self.assertTrue(out.behavior_verified, out.regression_output)
         # And the summary must NOT claim tests validated the fix.
         self.assertNotIn("validated by tests", out.final_summary)
-        self.assertIn("UNVERIFIED", out.final_summary)
+        self.assertIn("were not executed", out.final_summary.lower())
+        self.assertEqual(out.verification_status,
+                         VerificationStatus.PARTIALLY_VERIFIED)
+        self.assertIs(out.tests_ran, False)
 
     # -- failing-then-passing suite ----------------------------------------
 
@@ -2531,3 +2785,288 @@ class PublicScanAPITests(APITestCase):
                 status.HTTP_429_TOO_MANY_REQUESTS,
             ],
         )
+
+
+# ---------------------------------------------------------------------------
+# Reliable AI bug-fixing workflow -- acceptance criteria (spec 2/4/F/G)
+# ---------------------------------------------------------------------------
+
+
+class AgentOwnershipAPITests(AgentFixtureMixin, APITestCase):
+    """Agent runs belong to the user who launched them (spec 2, 7.16)."""
+
+    def _public_issue(self):
+        public_repo = Repository.objects.create(
+            owner=None,
+            github_url="https://github.com/octo/public-repo",
+            name="public-repo",
+        )
+        run = AnalysisRun.objects.create(repository=public_repo)
+        return Issue.objects.create(
+            analysis_run=run, file_path="app.py", line_number=2,
+            severity=Severity.LOW, description="x",
+        )
+
+    def test_create_records_launching_user(self):
+        self.client.force_authenticate(user=self.user)
+        finished = AgentRun.objects.create(
+            analysis_run=self.analysis_run, issue=self.issue,
+            user=self.user, status=RunStatus.COMPLETED,
+        )
+        with patch("analysis.agent_service.run_agent",
+                   return_value=finished) as mock_run:
+            response = self.client.post(
+                agent_run_url_for_issue(self.issue.pk)
+            )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        args, kwargs = mock_run.call_args
+        self.assertEqual(kwargs["user"], self.user)
+        # The pre-created (queued) run carries the owner from the start.
+        queued = AgentRun.objects.get(
+            issue=self.issue, status=RunStatus.PENDING
+        )
+        self.assertEqual(queued.user, self.user)
+
+    def test_other_user_cannot_read_my_run_on_public_scan(self):
+        """Public scan access never grants access to another user's runs."""
+        issue = self._public_issue()
+        run = AgentRun.objects.create(
+            analysis_run=issue.analysis_run, issue=issue,
+            user=self.user, status=RunStatus.COMPLETED,
+        )
+        CodeChange.objects.create(
+            agent_run=run, file_path="app.py",
+            proposed_diff=make_diff("app.py", BUGGY_SOURCE, FIXED_SOURCE),
+        )
+        self.client.force_authenticate(user=self.user)
+        self.assertEqual(
+            self.client.get(agent_detail_url(run.pk)).status_code,
+            status.HTTP_200_OK,
+        )
+        self.client.force_authenticate(user=self.other)
+        for url in (agent_detail_url(run.pk),
+                    agent_changes_url(run.pk), agent_tests_url(run.pk)):
+            self.assertEqual(
+                self.client.get(url).status_code,
+                status.HTTP_404_NOT_FOUND,
+            )
+
+    def test_anonymous_cannot_read_agent_run_data(self):
+        issue = self._public_issue()
+        run = AgentRun.objects.create(
+            analysis_run=issue.analysis_run, issue=issue,
+            user=self.user, status=RunStatus.COMPLETED,
+        )
+        response = self.client.get(agent_detail_url(run.pk))
+        self.assertIn(
+            response.status_code,
+            (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN),
+        )
+
+    def test_legacy_userless_run_on_public_scan_stays_readable(self):
+        """Rows created before the user field keep their old visibility."""
+        issue = self._public_issue()
+        run = AgentRun.objects.create(
+            analysis_run=issue.analysis_run, issue=issue,
+            status=RunStatus.COMPLETED,   # no user: legacy row
+        )
+        self.client.force_authenticate(user=self.other)
+        self.assertEqual(
+            self.client.get(agent_detail_url(run.pk)).status_code,
+            status.HTTP_200_OK,
+        )
+
+
+class AgentConcurrencyGuardTests(AgentFixtureMixin, APITestCase):
+    """Duplicate/concurrent submissions never launch duplicate runs (7.15)."""
+
+    def test_stale_pending_run_stops_blocking(self):
+        """A crashed worker's leftover PENDING run expires after the window."""
+        from .views import AGENT_RUN_STALE_AFTER
+
+        stale = AgentRun.objects.create(
+            analysis_run=self.analysis_run, issue=self.issue,
+            status=RunStatus.PENDING,
+        )
+        AgentRun.objects.filter(pk=stale.pk).update(
+            updated_at=timezone.now() - AGENT_RUN_STALE_AFTER
+            - timedelta(minutes=1)
+        )
+        self.client.force_authenticate(user=self.user)
+        finished = AgentRun.objects.create(
+            analysis_run=self.analysis_run, issue=self.issue,
+            status=RunStatus.COMPLETED,
+        )
+        with patch("analysis.agent_service.run_agent",
+                   return_value=finished) as mock_run:
+            response = self.client.post(
+                agent_run_url_for_issue(self.issue.pk)
+            )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        mock_run.assert_called_once()
+
+    def test_guard_creates_queued_run_owned_by_user(self):
+        """The queued row exists (with owner) before execution starts."""
+        self.client.force_authenticate(user=self.user)
+        finished = AgentRun.objects.create(
+            analysis_run=self.analysis_run, issue=self.issue,
+            user=self.user, status=RunStatus.COMPLETED,
+        )
+        observed = {}
+
+        def fake_run(issue, user=None, agent_run=None):
+            observed["run"] = agent_run
+            observed["user"] = user
+            return finished
+
+        with patch("analysis.agent_service.run_agent",
+                   side_effect=fake_run):
+            response = self.client.post(
+                agent_run_url_for_issue(self.issue.pk)
+            )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(observed["user"], self.user)
+        self.assertIsNotNone(observed["run"])
+        self.assertEqual(observed["run"].status, RunStatus.PENDING)
+        self.assertEqual(observed["run"].user, self.user)
+
+
+@override_settings(AGENT_TEST_EXECUTION=False)
+class AgentVerificationMappingTests(AgentFixtureMixin, TestCase):
+    """Spec 4: the verdict is mapped from checks that ACTUALLY ran."""
+
+    def _run_with(self, snapshot=None, chat=None, analyzer=None,
+                  sandbox=_SENTINEL):
+        snap = snapshot or make_snapshot()
+        chat_kw = (
+            {"side_effect": chat} if isinstance(chat, list)
+            else {"return_value": chat or GOOD_PATCH}
+        )
+        analyzer_kw = (
+            {"side_effect": analyzer} if isinstance(analyzer, list)
+            else {"return_value": analyzer or CLEAN_ANALYZER}
+        )
+        if sandbox is _SENTINEL:
+            sandbox_kw = {"return_value": SandboxResult(0, "OK")}
+        elif isinstance(sandbox, list):
+            sandbox_kw = {"side_effect": sandbox}
+        else:
+            sandbox_kw = {"return_value": sandbox}
+        with patch(
+            "analysis.agent_service.fetch_github_snapshot", return_value=snap
+        ), patch(
+            "analysis.agent_service.chat_json", **chat_kw
+        ), patch(
+            "analysis.agent_service.call_analyzer", **analyzer_kw
+        ), patch(
+            "analysis.sandbox.run_tests", **sandbox_kw
+        ):
+            return run_agent(self.issue, user=self.user)
+
+    def test_spec_example_static_ok_tests_skipped_is_partial(self):
+        """Execution completed / verification partially verified (spec 4)."""
+        run = self._run_with(sandbox=None)
+        self.assertEqual(run.status, RunStatus.COMPLETED)
+        self.assertEqual(
+            run.verification_status, VerificationStatus.PARTIALLY_VERIFIED
+        )
+        self.assertIs(run.tests_ran, False)
+        results = {r.test_name: r.status for r in run.test_results.all()}
+        self.assertEqual(results["syntax:app.py"], TestStatus.PASSED)
+        self.assertEqual(results["static-analysis"], TestStatus.PASSED)
+        self.assertEqual(results["tests"], TestStatus.SKIPPED)
+
+    def test_zero_discovered_tests_never_counts_as_passed(self):
+        """'Ran 0 tests' with exit 0 is skipped, not passed (spec E)."""
+        empty = SandboxResult(0, "Ran 0 tests in 0.000s\n\nOK")
+        run = self._run_with(sandbox=empty)
+        tests_row = run.test_results.get(test_name="tests")
+        self.assertEqual(tests_row.status, TestStatus.SKIPPED)
+        self.assertIs(run.tests_ran, False)
+        self.assertEqual(
+            run.verification_status, VerificationStatus.PARTIALLY_VERIFIED
+        )
+
+    def test_python312_exit5_no_tests_is_skipped_not_failed(self):
+        """Python 3.12 unittest exits 5 + 'NO TESTS RAN' on empty discovery.
+
+        Verified live in python:3.12-slim: exit code 5. This must be an
+        honest skip (repo has no tests), never a failing verdict -- the
+        fix itself passed its syntax and static checks.
+        """
+        empty = SandboxResult(5, "Ran 0 tests in 0.000s\n\nNO TESTS RAN")
+        run = self._run_with(sandbox=empty)
+        self.assertEqual(run.status, RunStatus.COMPLETED)
+        tests_row = run.test_results.get(test_name="tests")
+        self.assertEqual(tests_row.status, TestStatus.SKIPPED)
+        self.assertIn("0 tests", tests_row.output)
+        self.assertEqual(
+            run.verification_status, VerificationStatus.PARTIALLY_VERIFIED
+        )
+        self.assertIs(run.tests_ran, False)
+
+    def test_real_failing_suite_still_counts_as_failed(self):
+        """Exit 5 skip logic must not swallow genuine suite failures."""
+        run = self._run_with(
+            sandbox=SandboxResult(1, "FAILED (failures=1)\nRan 3 tests")
+        )
+        rows = run.test_results.filter(test_name="tests")
+        # The failing suite triggers the one allowed retry, so both
+        # attempts ran and both recorded an honest failure.
+        self.assertEqual(rows.count(), 2)
+        self.assertTrue(all(r.status == TestStatus.FAILED for r in rows))
+        self.assertEqual(
+            run.verification_status, VerificationStatus.FAILED
+        )
+
+    def test_failed_checks_after_retry_yield_failed_verification(self):
+        run = self._run_with(sandbox=[SandboxResult(1, "boom"),
+                                      SandboxResult(1, "boom")])
+        # Exactly one repair retry: two attempts, then stop (spec F).
+        self.assertEqual(run.repair_attempts, 2)
+        self.assertEqual(run.status, RunStatus.COMPLETED)
+        self.assertEqual(
+            run.verification_status, VerificationStatus.FAILED
+        )
+        self.assertIs(run.tests_ran, True)
+
+    def test_workflow_failure_yields_unverified(self):
+        from repositories.services import GitHubRepoNotFound
+
+        with patch(
+            "analysis.agent_service.fetch_github_snapshot",
+            side_effect=GitHubRepoNotFound("Repository not found."),
+        ):
+            run = run_agent(self.issue, user=self.user)
+        self.assertEqual(run.status, RunStatus.FAILED)
+        self.assertEqual(
+            run.verification_status, VerificationStatus.UNVERIFIED
+        )
+        self.assertIsNone(run.tests_ran)
+
+    def test_user_recorded_on_run_produced_by_pipeline(self):
+        run = self._run_with()
+        self.assertEqual(run.user, self.user)
+        self.assertEqual(run.verification_status,
+                         VerificationStatus.VERIFIED)
+
+    def test_captured_output_is_sanitized(self):
+        """ANSI escapes from repository output never reach the database."""
+        colored = SandboxResult(1, "\x1b[31mFAILED\x1b[0m\x07 test_add")
+        run = self._run_with(sandbox=colored)
+        rows = run.test_results.filter(test_name="tests")
+        self.assertEqual(rows.count(), 2)   # both attempts actually ran
+        for row in rows:
+            self.assertNotIn("\x1b", row.output)
+            self.assertNotIn("\x07", row.output)
+            self.assertIn("FAILED", row.output)
+
+    def test_nothing_is_ever_pushed_or_committed(self):
+        """The pipeline has no git integration at all (spec 7.14)."""
+        from pathlib import Path as _Path
+
+        from . import agent_service as agent_mod
+
+        source = _Path(agent_mod.__file__).read_text(encoding="utf-8")
+        for forbidden in ("git push", "git commit", "git clone"):
+            self.assertNotIn(forbidden, source)

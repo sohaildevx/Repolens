@@ -27,7 +27,11 @@ code path for validation -> Flask -> save -> 201/502, so the two routes
 can never disagree on behavior.
 """
 
+from datetime import timedelta
+
+from django.db import transaction
 from django.db.models import Q
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.generics import (
     CreateAPIView,
@@ -79,6 +83,8 @@ class AgentRunThrottle(UserRateThrottle):
     """Per-user budget for AI agent executions (scope: agent_run)."""
 
     scope = "agent_run"
+
+AGENT_RUN_STALE_AFTER = timedelta(minutes=10)
 
 
 def _visible_run_q(user, prefix=""):
@@ -385,27 +391,44 @@ class AgentRunCreateView(CreateAPIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        # Duplicate-request guard: a run is executed synchronously, so an
-        # already in-flight run for this issue means a second submit is a
-        # duplicate (e.g. a double-click). Refuse it with 409 so we never
-        # spend a second Nebius call or race two runs on the same issue.
-        if AgentRun.objects.filter(
-            issue=issue,
-            status__in=[RunStatus.PENDING, RunStatus.RUNNING],
-        ).exists():
-            return Response(
-                {
-                    "detail": (
-                        "An agent run for this issue is already in progress."
-                    )
-                },
-                status=status.HTTP_409_CONFLICT,
+        # Duplicate/concurrency guard: the in-flight check AND the insert
+        # of the PENDING run happen inside one transaction holding a row
+        # lock on the issue, so two simultaneous submits (double-click, two
+        # tabs, two workers) are serialized at the database level -- the
+        # second sees the first one's in-flight run and is refused with 409
+        # BEFORE any Nebius call or snapshot fetch happens. Runs whose
+        # worker died mid-execution stop blocking after a staleness window
+        # so a crash can never permanently lock an issue.
+        stale_before = timezone.now() - AGENT_RUN_STALE_AFTER
+        with transaction.atomic():
+            Issue.objects.select_for_update().filter(pk=issue.pk).first()
+            if (
+                AgentRun.objects.filter(
+                    issue=issue,
+                    status__in=[RunStatus.PENDING, RunStatus.RUNNING],
+                )
+                .filter(updated_at__gte=stale_before)
+                .exists()
+            ):
+                return Response(
+                    {
+                        "detail": (
+                            "An agent run for this issue is already in progress."
+                        )
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+            agent_run = AgentRun.objects.create(
+                analysis_run=issue.analysis_run,
+                issue=issue,
+                user=request.user,
+                status=RunStatus.PENDING,
             )
 
         # Imported here so a circular import at module load is impossible.
         from .agent_service import run_agent
 
-        agent_run = run_agent(issue)
+        agent_run = run_agent(issue, user=request.user, agent_run=agent_run)
         serializer = self.get_serializer(agent_run)
         if agent_run.status == RunStatus.FAILED:
             return Response(serializer.data, status=status.HTTP_200_OK)
@@ -415,8 +438,11 @@ class AgentRunCreateView(CreateAPIView):
 class AgentRunOwnedMixin:
     """Shared queryset: runs the requesting user may read.
 
-    Agent endpoints always require authentication; access covers runs of
-    public scans (ownerless repositories) and of the user's own repos.
+    Agent endpoints always require authentication. A run belongs to the
+    user who launched it -- readable ONLY by them, even when it targets a
+    public scan (patches and test output are private agent data, and public
+    scan access never grants access to another user's runs). Legacy runs
+    without a recorded user keep the original repository-based visibility.
     """
 
     permission_classes = [IsAuthenticated]
@@ -428,8 +454,16 @@ class AgentRunOwnedMixin:
                 pk=self.kwargs["pk"],
             )
             .filter(
-                Q(analysis_run__repository__owner__isnull=True)
-                | Q(analysis_run__repository__owner=self.request.user)
+                Q(user=self.request.user)
+                | (
+                    Q(user__isnull=True)
+                    & (
+                        Q(analysis_run__repository__owner__isnull=True)
+                        | Q(
+                            analysis_run__repository__owner=self.request.user
+                        )
+                    )
+                )
             )
             .select_related("analysis_run__repository", "issue")
             .first()

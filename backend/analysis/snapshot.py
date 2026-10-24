@@ -134,12 +134,44 @@ class Snapshot:
     files: dict  # relative posix path -> content (str)
     skipped: list = field(default_factory=list)  # "path (reason)" notes
 
-    def context_for(self, path: str, max_bytes: int) -> str:
-        """Return one file's content for a prompt, truncated to max_bytes."""
+    def context_for(self, path: str, max_bytes: int,
+                    focus_line: int | None = None) -> str:
+        """Return one file's content for a prompt, truncated to max_bytes.
+
+        Head-truncation alone can hide the buggy line of a production-scale
+        file entirely (making an exact-match patch impossible); when the
+        file exceeds the budget and focus_line is given, a window of LINES
+        centered on that line is returned instead, with explicit omission
+        markers. Files within the budget are returned whole, unchanged.
+        """
         content = self.files.get(path, "")
-        if len(content) > max_bytes:
-            return content[:max_bytes] + "\n... [truncated for prompt size] ..."
-        return content
+        if len(content) <= max_bytes:
+            return content
+        lines = content.splitlines(keepends=True)
+        if focus_line and 1 <= focus_line <= len(lines):
+            idx = focus_line - 1
+            half = max_bytes // 2
+            start, used = idx, 0
+            while start > 0 and used + len(lines[start - 1]) <= half:
+                start -= 1
+                used += len(lines[start])
+            end, used_after = idx + 1, 0
+            while end < len(lines) and used_after + len(lines[end]) <= half:
+                used_after += len(lines[end])
+                end += 1
+            chunk = "".join(lines[start:end])
+            if len(chunk) > max_bytes:  # hard bound (fat lines)
+                focus_off = sum(len(line) for line in lines[start:idx])
+                bounded = chunk[:max_bytes]
+                cut = bounded.rfind("\n")
+                
+                if cut >= focus_off:
+                    bounded = bounded[:cut + 1]
+                chunk = bounded
+            prefix = "... [earlier lines omitted] ...\n" if start > 0 else ""
+            suffix = "\n... [later lines omitted] ..." if end < len(lines) else ""
+            return prefix + chunk + suffix
+        return content[:max_bytes] + "\n... [truncated for prompt size] ..."
 
 
 def is_sensitive_path(path: str) -> bool:
@@ -161,6 +193,23 @@ def is_sensitive_path(path: str) -> bool:
         or name.startswith(".env")
         or name.endswith(SENSITIVE_SUFFIXES)
     )
+
+
+def is_safe_rel_path(path: str) -> bool:
+    """True when a tree path is a safe repository-relative file path.
+
+    GitHub tree entries are untrusted input: this rejects absolute paths,
+    drive letters, backslashes, and traversal segments BEFORE anything is
+    written into the temp workspace (defense in depth -- the patch layer
+    re-checks containment on every write as well).
+    """
+    if not path or len(path) > 1024:
+        return False
+    if "\\" in path or ":" in path:
+        return False
+    if path.startswith("/"):
+        return False
+    return all(part not in ("", ".", "..") for part in path.split("/"))
 
 
 def _check_deadline(deadline: float) -> None:
@@ -266,6 +315,9 @@ def fetch_github_snapshot(repository) -> Snapshot:
         if is_sensitive_path(path):
             skipped.append(f"{path} (sensitive file excluded)")
             continue
+        if not is_safe_rel_path(path):
+            skipped.append(f"{path} (unsafe repository path rejected)")
+            continue
         try:
             size = int(entry.get("size") or 0)
         except (TypeError, ValueError):
@@ -291,10 +343,7 @@ def fetch_github_snapshot(repository) -> Snapshot:
             "some files were not considered)"
         )
 
-    # 4) Download the bounded blob set. A blob SHA is content-addressed and
-    #    immutable, so a cache hit is always byte-identical to a fresh fetch.
-    #    Consulted first to avoid re-downloading unchanged files across runs
-    #    for the same commit (the N+1 that exhausts the GitHub quota).
+   
     files = {}
     for path, blob_sha in candidates:
         cached = _BLOB_CACHE.get(blob_sha)

@@ -31,6 +31,7 @@ import logging
 from django.conf import settings
 from openai import (
     APIConnectionError,
+    APIStatusError,
     APITimeoutError,
     AuthenticationError,
     OpenAI,
@@ -40,9 +41,40 @@ from openai import (
 logger = logging.getLogger(__name__)
 
 # Hard bound on a single completion. Expected replies are small JSON objects
-# (one minimal patch, or one explanation), so 4096 tokens is generous while
-# still capping worst-case latency and transfer for a runaway generation.
-MAX_COMPLETION_TOKENS = 4096
+# (one minimal patch, or one explanation), BUT Nemotron is a hybrid REASONING
+# model: it thinks in a hidden reasoning channel before emitting visible text,
+# and that thinking is billed against this same budget. A budget that fits a
+# plain completion can be entirely consumed by reasoning, leaving an EMPTY
+# visible reply (verified live: even "say hi" spent ~490 reasoning tokens).
+# 16384 leaves generous room for hard-case reasoning plus the JSON while
+# still capping worst-case latency and transfer for a runaway generation;
+# NEBIUS_REASONING_EFFORT (default "low") keeps everyday thinking far below
+# this ceiling, so truncation stays rare (verified live against Nebius).
+MAX_COMPLETION_TOKENS = 16384
+
+# Official Nebius OpenAI-compatible generation knob for hybrid reasoning
+# models (verified live against the endpoint). Lower efforts bound the
+# hidden-thinking spend -- the failure mode where reasoning alone consumed
+# the entire completion budget before any visible text.
+REASONING_EFFORTS = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh"}
+)
+
+
+def _reasoning_effort_body() -> dict:
+    """kwargs fragment forwarding NEBIUS_REASONING_EFFORT to the SDK.
+
+    An empty value or "default" omits the parameter (provider default).
+    Unknown values are ignored with a logged warning (the value itself is
+    never logged; this is a generation knob, never a model switch).
+    """
+    effort = str(getattr(settings, "NEBIUS_REASONING_EFFORT", "") or "").strip().lower()
+    if not effort or effort == "default":
+        return {}
+    if effort not in REASONING_EFFORTS:
+        logger.warning("Ignoring unknown NEBIUS_REASONING_EFFORT value.")
+        return {}
+    return {"extra_body": {"reasoning_effort": effort}}
 
 
 class AIError(Exception):
@@ -109,6 +141,10 @@ def chat_json(system_prompt: str, user_prompt: str,
     truncated mid-JSON fails JSON parsing and surfaces as AIUnavailable --
     never as a silently half-applied patch.
 
+    NEBIUS_REASONING_EFFORT (default "low") bounds the hidden reasoning of
+    the hybrid Nemotron model via the official Nebius generation parameter,
+    keeping everyday thinking far below the completion budget.
+
     Raises:
         AIConfigurationError -- required variables missing (names only)
         AITimeout            -- endpoint exceeded NEBIUS_TIMEOUT
@@ -129,6 +165,7 @@ def chat_json(system_prompt: str, user_prompt: str,
             temperature=temperature,
             max_tokens=max_tokens,
             response_format={"type": "json_object"},
+            **_reasoning_effort_body(),
         )
     except APITimeoutError:
         # Must precede APIConnectionError (it is a subclass).
@@ -147,6 +184,16 @@ def chat_json(system_prompt: str, user_prompt: str,
             "AI rate limit or budget exhausted. Check the "
             "Token Factory project budget/quota."
         )
+    except APIStatusError as exc:
+       
+        status_code = getattr(exc, "status_code", None)
+        if isinstance(status_code, int) and status_code >= 500:
+            logger.warning("Nebius endpoint returned HTTP %s", status_code)
+            raise AIUnavailable(
+                "AI endpoint is temporarily unavailable "
+                f"(HTTP {status_code}); try again shortly."
+            )
+        raise AIUnavailable(f"AI request failed (HTTP {status_code}).")
     except APIConnectionError:
         raise AIUnavailable("AI service is unreachable.")
     except AIError:
@@ -158,15 +205,29 @@ def chat_json(system_prompt: str, user_prompt: str,
         raise AIUnavailable(f"AI request failed ({type(exc).__name__}).")
 
     try:
-        content = response.choices[0].message.content
+        choice = response.choices[0]
+        content = choice.message.content
     except (AttributeError, IndexError, TypeError):
         raise AIUnavailable("AI returned an unexpected response shape.")
+    finish_reason = getattr(choice, "finish_reason", None)
     if not content:
+       
+        logger.warning("Nebius reply empty (finish_reason=%s)", finish_reason)
+        if finish_reason == "length":
+            raise AIUnavailable(
+                "AI reply was cut off by the completion token limit before "
+                "producing any output."
+            )
         raise AIUnavailable("AI returned an empty response.")
 
     try:
         payload = json.loads(content)
     except (json.JSONDecodeError, ValueError):
+        if finish_reason == "length":
+            raise AIUnavailable(
+                "AI reply was cut off by the completion token limit "
+                "(truncated JSON)."
+            )
         raise AIUnavailable("AI did not return valid JSON.")
     if not isinstance(payload, dict):
         raise AIUnavailable("AI returned JSON that is not an object.")

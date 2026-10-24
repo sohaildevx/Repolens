@@ -23,6 +23,8 @@ from .snapshot import is_sensitive_path
 
 # Stored diffs are truncated well below this bound.
 MAX_DIFF_CHARS = 20_000
+# The model's own explanation is bounded before it reaches the DB/API.
+MAX_EXPLANATION_CHARS = 4_000
 
 
 class PatchError(Exception):
@@ -32,8 +34,10 @@ class PatchError(Exception):
 def parse_patch(reply, snapshot) -> dict:
     """Validate the model's JSON reply against the snapshot.
 
-    Returns {"path", "old_code", "new_code"} on success; raises PatchError
-    with a safe message otherwise.
+    Returns {"path", "old_code", "new_code", "explanation"} on success;
+    raises PatchError with a safe message otherwise. The explanation is
+    part of the required structured output: a patch the model cannot
+    justify is rejected like any other malformed reply.
     """
     if not isinstance(reply, dict):
         raise PatchError("AI response was not a JSON object.")
@@ -41,6 +45,8 @@ def parse_patch(reply, snapshot) -> dict:
     path = reply.get("path")
     old_code = reply.get("old_code")
     new_code = reply.get("new_code")
+    explanation = reply.get("explanation")
+    expected_behavior = reply.get("expected_behavior")
 
     if not isinstance(path, str) or not path:
         raise PatchError("AI patch is missing a file path.")
@@ -60,16 +66,37 @@ def parse_patch(reply, snapshot) -> dict:
     if new_code == old_code:
         raise PatchError("AI patch replacement is identical to the original.")
 
+    if not isinstance(explanation, str) or not explanation.strip():
+        raise PatchError("AI patch is missing an explanation.")
+    if not isinstance(expected_behavior, (str, type(None))):
+        raise PatchError("AI patch has an invalid expected behavior field.")
+
     occurrences = snapshot.files[path].count(old_code)
     if occurrences == 0:
         raise PatchError(
-            "AI patch original code does not match the snapshot file."
+            "AI patch original code does not match the snapshot file. "
+            "Copy old_code byte-for-byte from the file content (identical "
+            "indentation and quotes, no ellipsis or reindentation) as a "
+            "contiguous snippet that appears exactly once."
         )
     if occurrences > 1:
         raise PatchError(
             "AI patch original code is ambiguous (matches more than once)."
         )
-    return {"path": path, "old_code": old_code, "new_code": new_code}
+
+    # One bounded text block: the explanation, plus expected behavior when
+    # the model supplied it.
+    full_explanation = explanation.strip()
+    if isinstance(expected_behavior, str) and expected_behavior.strip():
+        full_explanation += (
+            "\n\nExpected behavior: " + expected_behavior.strip()
+        )
+    return {
+        "path": path,
+        "old_code": old_code,
+        "new_code": new_code,
+        "explanation": full_explanation[:MAX_EXPLANATION_CHARS],
+    }
 
 
 def apply_patch(workspace: Path, path: str, old_code: str, new_code: str) -> str:

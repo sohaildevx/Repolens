@@ -106,7 +106,16 @@ ANALYZER_TOKEN = os.environ.get('ANALYZER_TOKEN', '')
 NEBIUS_API_KEY = os.environ.get('NEBIUS_API_KEY', '')
 NEBIUS_BASE_URL = os.environ.get('NEBIUS_BASE_URL', 'https://api.tokenfactory.nebius.com/v1/')
 NEBIUS_MODEL = os.environ.get('NEBIUS_MODEL', '')
-NEBIUS_TIMEOUT_SECONDS = int(os.environ.get('NEBIUS_TIMEOUT', '30'))
+# Nemotron is a hybrid reasoning model: it can think for a while before
+# replying, so the default request timeout is generous (120s). Raising this
+# only applies when NEBIUS_TIMEOUT is unset in .env.
+NEBIUS_TIMEOUT_SECONDS = int(os.environ.get('NEBIUS_TIMEOUT', '120'))
+# Nebius reasoning effort for the hybrid Nemotron model (official API enum:
+# none|minimal|low|medium|high|xhigh). "low" keeps hidden reasoning far
+# below the completion budget so replies are not cut off mid-generation,
+# and cuts latency/cost. Set NEBIUS_REASONING_EFFORT=default in .env to
+# omit the parameter and use the provider default instead.
+NEBIUS_REASONING_EFFORT = os.environ.get('NEBIUS_REASONING_EFFORT', 'low')
 
 # ---------------------------------------------------------------------------
 # Agent run -- patch generation, validation and sandbox limits.

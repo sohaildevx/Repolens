@@ -226,9 +226,12 @@ class AgentRunSerializer(serializers.ModelSerializer):
             "analysis_run",
             "issue_id",
             "status",
+            "verification_status",
+            "tests_ran",
             "repair_attempts",
             "start_commit_sha",
             "final_summary",
+            "explanation",
             "checks",
             "created_at",
             "updated_at",
@@ -248,7 +251,7 @@ class CodeChangeSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = CodeChange
-        fields = ("id", "file_path", "proposed_diff", "created_at")
+        fields = ("id", "file_path", "proposed_diff", "attempt", "created_at")
         read_only_fields = fields
 
 
