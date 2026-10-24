@@ -1,19 +1,4 @@
-/**
- * RepoLens API client.
- *
- * Talks to the Django backend through same-origin /api/... (the Vite dev
- * server proxies to the backend; production serves both from one origin).
- *
- * Auth model of the current backend:
- * - Public scans: POST /api/analysis/scans/ + all read endpoints work
- *   anonymously (rate-limited server-side).
- * - AI fixes (agent runs): always require a signed-in session.
- *
- * CSRF: SessionAuthentication re-checks CSRF on any request that carries a
- * session. We bootstrap the csrftoken cookie once and echo it back as the
- * X-CSRFToken header. Tokens live only in cookies/headers -- never in
- * localStorage.
- */
+
 
 export class ApiError extends Error {
   readonly status: number
@@ -28,12 +13,6 @@ export class ApiError extends Error {
   }
 }
 
-/* ------------------------------------------------------------------ *
- * URL validation -- client-side mirror of the backend's
- * repositories.services.parse_github_repo_url, so users get instant
- * feedback. The backend remains the authority; its message wins on
- * any disagreement.
- * ------------------------------------------------------------------ */
 
 const OWNER_RE = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/
 const REPO_RE = /^[A-Za-z0-9._-]{1,100}$/
@@ -335,6 +314,45 @@ export async function getCurrentUser(): Promise<{
 export function logout(): Promise<{ detail: string }> {
   return apiFetch<{ detail: string }>('/api/auth/logout/', {
     method: 'POST',
+  })
+}
+
+export interface AuthUser {
+  id: number
+  username: string
+  email: string
+  date_joined: string
+  last_login: string | null
+}
+
+/**
+ * Sign in. The backend opens a session cookie server-side; one generic
+ * 401 covers unknown username AND wrong password (no user enumeration).
+ */
+export function login(
+  username: string,
+  password: string,
+): Promise<{ detail: string; user: AuthUser }> {
+  return apiFetch<{ detail: string; user: AuthUser }>('/api/auth/login/', {
+    method: 'POST',
+    body: { username, password },
+  })
+}
+
+export interface RegisterInput {
+  username: string
+  email: string
+  password: string
+  password_confirm: string
+}
+
+
+export function register(
+  input: RegisterInput,
+): Promise<{ detail: string; user: AuthUser }> {
+  return apiFetch<{ detail: string; user: AuthUser }>('/api/auth/register/', {
+    method: 'POST',
+    body: input,
   })
 }
 

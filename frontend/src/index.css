@@ -117,4 +117,14 @@
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+
+  /* Busy spinners are functional feedback (a frozen ring conveys
+     nothing), so they are exempted from the reduced-motion freeze.
+     Specificity beats the `*` rule above; same !important level,
+     later position wins. */
+  .animate-spin,
+  [data-slot='spinner'] {
+    animation-duration: 1s !important;
+    animation-iteration-count: infinite !important;
+  }
 }
